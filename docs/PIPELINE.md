@@ -17,7 +17,6 @@ pipeline/
     02_stg_transactions.py    # build stg_transaction_normalized
     03_stg_customers.py       # build stg_customer_enriched
     10_fct_risk_profile.py    # build fct_customer_risk_profile
-    11_fct_sar_candidates.py  # build fct_regulatory_sar_candidates
     99_validate_outputs.py    # DQ gate over Layer 1 outputs (exits 1 on any fail)
 logs/                         # one {run_id}.jsonl per pipeline run (auto-created)
 ```

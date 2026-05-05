@@ -15,8 +15,7 @@ artefacts — no separate data store.
 | `#/runs/{id}`  | Run detail — stages + every DQ check |
 | `#/lineage`    | Lineage Explorer — interactive vis-network graph; click any node to inspect |
 | `#/datasets`   | Datasets browser (DataSet vertices in the graph) |
-| `#/dq`         | DQ Console — latest run's 20 checks with pass/fail |
-| `#/sar`        | SAR Candidates — flagged customers from `fct_regulatory_sar_candidates` |
+| `#/dq`         | DQ Console — latest run's checks with pass/fail |
 
 ## Run
 
@@ -41,7 +40,6 @@ Override host/port via `TRACEX_UI_HOST` / `TRACEX_UI_PORT`. Default port is **87
 | GET    | `/api/lineage/dataset/{name}` | upstream + downstream tables |
 | GET    | `/api/datasets`               | every DataSet in the graph |
 | GET    | `/api/dq/{run_id}`            | DQ checks grouped by stage |
-| GET    | `/api/sar`                    | SAR candidates ordered by risk_score desc |
 | GET    | `/healthz`                    | `{ok: true}` |
 
 ## Design system mapping

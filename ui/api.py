@@ -11,7 +11,6 @@ Endpoints:
     GET  /api/runs/{run_id}              — single run with all stages + DQ checks
     GET  /api/lineage/graph              — full graph for vis-network
     GET  /api/lineage/dataset/{name}     — upstream/downstream of a dataset
-    GET  /api/sar                        — SAR candidate rows from DuckDB
     GET  /api/dq/{run_id}                — DQ check results from a run
 """
 from __future__ import annotations
@@ -167,20 +166,11 @@ def dashboard():
         node_counts = {}
         edge_counts = {}
 
-    # SAR candidate count — from DuckDB.
-    try:
-        (sar_count,) = duck().execute(
-            "SELECT COUNT(*) FROM fct_regulatory_sar_candidates"
-        ).fetchone()
-    except Exception:
-        sar_count = 0
-
     return {
         "pipeline_runs_total": len(runs),
         "datasets_total": int(node_counts.get("DataSet", 0)),
         "columns_total": int(node_counts.get("Column", 0)),
         "processes_total": int(node_counts.get("Process", 0)),
-        "sar_candidates_total": int(sar_count),
         "latest_run": latest,
         "graph_node_counts": node_counts,
         "graph_edge_counts": edge_counts,
@@ -325,53 +315,6 @@ def dataset_lineage(name: str):
         "upstream": get_dataset_upstream(c, name),
         "downstream": get_dataset_downstream(c, name),
     }
-
-
-# ----------------------------------------------------------------------
-# /api/sar — flagged customers from fct_regulatory_sar_candidates
-# ----------------------------------------------------------------------
-
-@app.get("/api/sar")
-def sar_candidates(limit: int = 200):
-    try:
-        rows = duck().execute(
-            """
-            SELECT
-                customer_id,
-                full_name,
-                ROUND(risk_score, 4)        AS risk_score,
-                risk_tier,
-                sar_priority,
-                flagging_reasons,
-                CAST(total_suspicious_amount_usd AS DOUBLE) AS total_suspicious_amount_usd,
-                suspicious_txn_count,
-                counterparty_countries,
-                dominant_channel,
-                kyc_stale_flag,
-                branch_region
-            FROM fct_regulatory_sar_candidates
-            ORDER BY risk_score DESC
-            LIMIT ?
-            """,
-            [limit],
-        ).fetchall()
-    except Exception as exc:
-        raise HTTPException(503, f"fct_regulatory_sar_candidates unavailable: {exc}")
-
-    cols = [
-        "customer_id", "full_name", "risk_score", "risk_tier", "sar_priority",
-        "flagging_reasons", "total_suspicious_amount_usd", "suspicious_txn_count",
-        "counterparty_countries", "dominant_channel", "kyc_stale_flag", "branch_region",
-    ]
-    out = []
-    for r in rows:
-        d = dict(zip(cols, r))
-        # Make lists JSON-friendly (DuckDB returns them as Python lists already, but be safe).
-        d["flagging_reasons"] = list(d["flagging_reasons"] or [])
-        d["counterparty_countries"] = list(d["counterparty_countries"] or [])
-        d["kyc_stale_flag"] = bool(d["kyc_stale_flag"])
-        out.append(d)
-    return out
 
 
 # ----------------------------------------------------------------------

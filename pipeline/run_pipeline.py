@@ -32,7 +32,6 @@ STAGES = [
     "02_stg_transactions.py",
     "03_stg_customers.py",
     "10_fct_risk_profile.py",
-    "11_fct_sar_candidates.py",
     "99_validate_outputs.py",
 ]
 

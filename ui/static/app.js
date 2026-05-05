@@ -99,11 +99,10 @@ const App = (() => {
 
       // Metric strip
       const metrics = `
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6 animate-fadein">
+        <div class="grid grid-cols-2 md:grid-cols-3 gap-4 mb-6 animate-fadein">
           ${metricCard('Pipeline runs',     fmtInt(d.pipeline_runs_total),  'JSONL logs persisted')}
           ${metricCard('Datasets in graph', fmtInt(d.datasets_total),       `${fmtInt(d.columns_total)} columns · ${fmtInt(d.processes_total)} processes`)}
           ${metricCard('DQ checks',         d.dq_pass_rate,                 'Latest run gate', d.latest_run && d.latest_run.dq_passed === d.latest_run.dq_total ? '#1a7f4b' : '#b45309')}
-          ${metricCard('SAR candidates',    fmtInt(d.sar_candidates_total), 'Customers awaiting review', '#b91c1c')}
         </div>
       `;
 
@@ -426,69 +425,6 @@ const App = (() => {
     } catch (e) { setError(e); }
   }
 
-  async function viewSAR() {
-    setLoading();
-    try {
-      const rows = await api('/api/sar');
-
-      const tbody = rows.map(r => {
-        const reasons = (r.flagging_reasons || []).map(x => `<span class="chip-mono">${esc(x)}</span>`).join(' ');
-        const countries = (r.counterparty_countries || []).slice(0, 6).map(x => `<span class="chip-mono">${esc(x)}</span>`).join(' ');
-        const more = (r.counterparty_countries || []).length > 6 ? `<span class="text-g-400 text-[10px]">+${r.counterparty_countries.length - 6}</span>` : '';
-        return `
-          <tr>
-            <td class="mono text-g-700">${esc(r.customer_id)}</td>
-            <td class="text-g-800">${esc(r.full_name)}</td>
-            <td>${riskBadge(r.sar_priority)}</td>
-            <td class="text-right mono">${esc(Number(r.risk_score).toFixed(4))}</td>
-            <td class="text-right mono">${fmtUsd(r.total_suspicious_amount_usd)}</td>
-            <td class="text-right mono">${fmtInt(r.suspicious_txn_count)}</td>
-            <td>${reasons}</td>
-            <td>${countries} ${more}</td>
-            <td class="mono text-g-500">${esc(r.dominant_channel || '—')}</td>
-            <td>${r.kyc_stale_flag ? '<span class="badge badge-amber">stale</span>' : '<span class="text-g-400 text-[11px]">—</span>'}</td>
-            <td class="mono text-g-500">${esc(r.branch_region || '—')}</td>
-          </tr>
-        `;
-      }).join('');
-
-      const summary = (() => {
-        const c = { CRITICAL: 0, HIGH: 0, MEDIUM: 0 };
-        rows.forEach(r => { if (c[r.sar_priority] != null) c[r.sar_priority]++; });
-        return `
-          <div class="flex items-center gap-2 mb-4">
-            <span class="badge risk-CRITICAL">${c.CRITICAL} CRITICAL</span>
-            <span class="badge risk-HIGH">${c.HIGH} HIGH</span>
-            <span class="badge risk-MEDIUM">${c.MEDIUM} MEDIUM</span>
-          </div>
-        `;
-      })();
-
-      root.innerHTML = pageHeader(
-        'SAR Candidates',
-        `${rows.length} customers from fct_regulatory_sar_candidates`,
-        ''
-      ) + summary + `
-        <div class="card animate-fadein">
-          <table class="tbl">
-            <thead><tr>
-              <th>Customer</th><th>Name</th><th>Priority</th>
-              <th class="text-right">Risk</th>
-              <th class="text-right">Suspicious USD</th>
-              <th class="text-right">Intl txns</th>
-              <th>Reasons</th>
-              <th>Counterparty countries</th>
-              <th>Channel</th>
-              <th>KYC</th>
-              <th>Region</th>
-            </tr></thead>
-            <tbody>${tbody || '<tr><td colspan="11" class="text-g-400">no candidates</td></tr>'}</tbody>
-          </table>
-        </div>
-      `;
-    } catch (e) { setError(e); }
-  }
-
   // ---------- router ---------------------------------------------------
 
   const routes = [
@@ -498,7 +434,6 @@ const App = (() => {
     { match: /^#\/lineage$/,                        view: () => viewLineage(),                       nav: 'lineage' },
     { match: /^#\/datasets$/,                       view: () => viewDatasets(),                      nav: 'datasets' },
     { match: /^#\/dq$/,                             view: () => viewDQ(),                            nav: 'dq' },
-    { match: /^#\/sar$/,                            view: () => viewSAR(),                           nav: 'sar' },
   ];
 
   function setActiveNav(name) {

@@ -5,8 +5,7 @@ rows_checked, rows_failed, and passed. The stage exits non-zero if any check fai
 that turns this script into a hard merge gate when wired into Airflow / cron.
 
 L1 checks preserved verbatim from the prior version (10 checks, names unchanged).
-L2 adds checks L2_DQ_01..L2_DQ_10 for fct_customer_risk_profile and
-fct_regulatory_sar_candidates.
+L2 adds checks L2_DQ_01..L2_DQ_05 for fct_customer_risk_profile.
 """
 from __future__ import annotations
 
@@ -149,7 +148,6 @@ def _build_l1_checks(con) -> list[Callable[[], CheckResult]]:
 
 def _build_l2_checks(con) -> list[Callable[[], CheckResult]]:
     rp_total = table_row_count(con, "fct_customer_risk_profile")
-    sar_total = table_row_count(con, "fct_regulatory_sar_candidates")
     src_cust_total = table_row_count(con, "src_customer")
 
     # ---- fct_customer_risk_profile ----------------------------------------
@@ -216,87 +214,12 @@ def _build_l2_checks(con) -> list[Callable[[], CheckResult]]:
             rows_checked=rp_total, rows_failed=bad, passed=bad == 0,
         )
 
-    # ---- fct_regulatory_sar_candidates ------------------------------------
-
-    def l2_dq_06_at_least_one_reason() -> CheckResult:
-        bad = _scalar(
-            con,
-            "SELECT COUNT(*) FROM fct_regulatory_sar_candidates "
-            "WHERE flagging_reasons IS NULL OR len(flagging_reasons) < 1",
-        )
-        return CheckResult(
-            "L2_DQ_06",
-            expected="every row has >=1 flagging_reason",
-            actual=f"{bad} rows without reasons",
-            rows_checked=sar_total, rows_failed=bad, passed=bad == 0,
-        )
-
-    def l2_dq_07_priority_domain() -> CheckResult:
-        bad = _scalar(
-            con,
-            "SELECT COUNT(*) FROM fct_regulatory_sar_candidates "
-            "WHERE sar_priority NOT IN ('CRITICAL','HIGH','MEDIUM')",
-        )
-        return CheckResult(
-            "L2_DQ_07",
-            expected="sar_priority in (CRITICAL, HIGH, MEDIUM)",
-            actual=f"{bad} out-of-domain rows",
-            rows_checked=sar_total, rows_failed=bad, passed=bad == 0,
-        )
-
-    def l2_dq_08_suspicious_amount_nonneg() -> CheckResult:
-        bad = _scalar(
-            con,
-            "SELECT COUNT(*) FROM fct_regulatory_sar_candidates "
-            "WHERE total_suspicious_amount_usd < 0",
-        )
-        return CheckResult(
-            "L2_DQ_08",
-            expected="total_suspicious_amount_usd >= 0",
-            actual=f"{bad} negative rows",
-            rows_checked=sar_total, rows_failed=bad, passed=bad == 0,
-        )
-
-    def l2_dq_09_customer_unique() -> CheckResult:
-        dupes = _scalar(
-            con,
-            "SELECT COUNT(*) - COUNT(DISTINCT customer_id) "
-            "FROM fct_regulatory_sar_candidates",
-        )
-        return CheckResult(
-            "L2_DQ_09",
-            expected="customer_id unique",
-            actual=f"{dupes} duplicate customer_ids",
-            rows_checked=sar_total, rows_failed=dupes, passed=dupes == 0,
-        )
-
-    def l2_dq_10_referential_integrity() -> CheckResult:
-        bad = _scalar(
-            con,
-            "SELECT COUNT(*) FROM fct_regulatory_sar_candidates s "
-            "WHERE NOT EXISTS ("
-            "  SELECT 1 FROM fct_customer_risk_profile rp "
-            "  WHERE rp.customer_id = s.customer_id"
-            ")",
-        )
-        return CheckResult(
-            "L2_DQ_10",
-            expected="every SAR customer_id present in fct_customer_risk_profile",
-            actual=f"{bad} orphan rows",
-            rows_checked=sar_total, rows_failed=bad, passed=bad == 0,
-        )
-
     return [
         l2_dq_01_risk_score_range,
         l2_dq_02_no_nulls,
         l2_dq_03_one_per_customer,
         l2_dq_04_three_tiers,
         l2_dq_05_volume_nonneg,
-        l2_dq_06_at_least_one_reason,
-        l2_dq_07_priority_domain,
-        l2_dq_08_suspicious_amount_nonneg,
-        l2_dq_09_customer_unique,
-        l2_dq_10_referential_integrity,
     ]
 
 
@@ -313,7 +236,6 @@ def main() -> int:
                     "stg_transaction_normalized",
                     "stg_customer_enriched",
                     "fct_customer_risk_profile",
-                    "fct_regulatory_sar_candidates",
                 ],
             )
 
