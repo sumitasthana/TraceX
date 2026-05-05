@@ -16,3 +16,6 @@ logs/*.jsonl
 # Editor / IDE
 .vscode/
 .idea/
+
+# Claude Code internal scratch (worktrees, etc.)
+.claude/
