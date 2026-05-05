@@ -7,12 +7,13 @@ serves the whole thing through a FastAPI + Tailwind UI.
 
 ## Layout
 
-```
+```text
 TraceX/
 ├── README.md                  this file
+├── cli.py                     `python cli.py {up|serve|generate|load|pipeline|ingest|...}`
 ├── docker-compose.yaml        JanusGraph (Gremlin :8182)
 ├── requirements.txt           consolidated Python deps
-├── start-all.ps1              one-shot bootstrap (generate → load → run → ingest → UI)
+├── start-all.ps1              thin wrapper around `python cli.py up`
 │
 ├── data/                      all persistent artefacts live here
 │   ├── layer0/                synthetic raw CSVs
@@ -57,25 +58,32 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## End-to-end run
+## CLI
+
+Every operation runs through `cli.py`. The CLI is the single entrypoint — there is
+no separate frontend / backend process: `serve` launches one FastAPI process that
+hosts the SPA at `/` and the JSON API at `/api/*`.
 
 ```powershell
-.\start-all.ps1
+python cli.py up           # bootstrap + serve (skips steps whose outputs exist)
+python cli.py up --force   # re-run generate + load even if outputs exist
+python cli.py serve        # launch UI + API only
+python cli.py status       # report which artefacts exist on disk
 ```
 
-The script generates Layer 0 CSVs, builds the DuckDB, runs the pipeline, ingests
-the resulting JSONL into the lineage graph, and starts the UI on
-http://127.0.0.1:8765.
+| Subcommand     | What it does                                                    |
+|----------------|-----------------------------------------------------------------|
+| `up`           | generate → load → pipeline → ingest → serve (skips if cached)   |
+| `serve`        | FastAPI on `--host`/`--port` (defaults `127.0.0.1:8765`)        |
+| `generate`     | Faker → `data/layer0/*.csv`                                     |
+| `load`         | CSVs → `data/tracex_layer0.duckdb`                              |
+| `pipeline`     | run staging + facts; writes `logs/{run_id}.jsonl`               |
+| `ingest`       | `--latest` (default), `--run-id ID`, or `--log-file PATH`       |
+| `healthcheck`  | wait for JanusGraph + bootstrap schema + smoke test             |
+| `status`       | show which artefacts exist on disk                              |
 
-Or step-by-step:
-
-```powershell
-python layer0\generate.py              # → data/layer0/*.csv
-python layer0\load_duckdb.py           # → data/tracex_layer0.duckdb
-python pipeline\run_pipeline.py        # → logs/{run_id}.jsonl, layer1+2 tables
-python lineage\ingest.py --latest      # → data/tracex_graph
-python ui\serve.py                     # → http://127.0.0.1:8765
-```
+`.\start-all.ps1` is a one-line wrapper around `python cli.py up`. After it
+finishes the bootstrap, the UI is reachable at <http://127.0.0.1:8765>.
 
 ## JanusGraph (optional)
 
