@@ -1113,15 +1113,40 @@ const Discover = (() => {
     return el;
   }
 
-  // Render assistant message: highlight `table.column` patterns as chips,
-  // convert **bold** to <strong>, convert newlines to <br>.
+  // Render assistant message as proper prose: parse the agent's markdown
+  // (headers / lists / hr / code blocks / bold) via the `marked` CDN library,
+  // then post-process to swap inline-code that looks like `table.column`
+  // for our teal chip and turn CRITICAL/HIGH/MEDIUM/LOW words into severity
+  // badges. Falls back to a minimal renderer if marked isn't loaded.
   function renderAssistant(text) {
-    let s = escHtml(text);
-    s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    s = s.replace(/`([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?)`/gi,
-      '<span class="col-ref">$1</span>');
-    s = s.replace(/\n/g, '<br>');
-    return s;
+    const raw = String(text || '');
+    let html;
+    try {
+      if (window.marked && typeof window.marked.parse === 'function') {
+        html = window.marked.parse(raw, { gfm: true, breaks: false });
+      } else {
+        html = escHtml(raw)
+          .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+          .replace(/\n/g, '<br>');
+      }
+    } catch {
+      html = escHtml(raw).replace(/\n/g, '<br>');
+    }
+
+    // Inline `<code>foo.bar</code>` or `<code>kyc_stale_flag</code>` → teal chip.
+    html = html.replace(
+      /<code>([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?)<\/code>/gi,
+      '<span class="col-ref">$1</span>'
+    );
+
+    // Severity words at word boundaries — only outside HTML attributes.
+    // Lookbehind prevents matching inside class="sev-HIGH" etc.
+    html = html.replace(
+      /(^|[^<="\w-])(CRITICAL|HIGH|MEDIUM|LOW)\b/g,
+      (_, prefix, sev) => `${prefix}<span class="sev sev-${sev}">${sev}</span>`
+    );
+
+    return `<div class="disc-prose">${html}</div>`;
   }
 
   // Per-turn thinking stream — appended to the conversation flow.
