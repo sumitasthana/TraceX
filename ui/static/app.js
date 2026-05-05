@@ -919,7 +919,6 @@ const App = (() => {
 const ChatPanel = (() => {
   let conversationId = null;
   let isOpen = false;
-  let activeThoughts = [];   // currently-rendered thinking bubbles, in order
 
   function drawer()   { return document.getElementById('chat-drawer'); }
   function messages() { return document.getElementById('chat-messages'); }
@@ -977,31 +976,43 @@ const ChatPanel = (() => {
     return el;
   }
 
-  // Append a new green pulsating "thinking" bubble. Fade any prior bubbles
-  // in this turn to gray. Tracks them so we can vanish all at the end.
-  function appendThought(text) {
-    // Fade all prior active bubbles
-    activeThoughts.forEach(el => {
-      el.classList.remove('chat-thought-active');
-      el.classList.add('chat-thought-fade');
-    });
+  // ReconX ThinkingStream pattern: a per-turn vertical stream of thought
+  // lines. The latest line shows a pulsating green dot + blinking cursor;
+  // older lines fade to 0.55 opacity. The whole stream stays visible
+  // alongside the final answer so the user can see what the agent did.
+
+  function newThinkingStream() {
     const el = document.createElement('div');
-    el.className = 'chat-thought chat-thought-active';
-    el.innerHTML = `<span class="chat-thought-dot"></span><span class="chat-thought-text"></span>`;
-    el.querySelector('.chat-thought-text').textContent = text;
+    el.className = 'chat-thinking-stream';
     messages().appendChild(el);
-    activeThoughts.push(el);
+    return el;
+  }
+
+  function addThinkingLine(stream, text) {
+    if (!stream) return;
+    // Demote any prior "latest" line to "older"
+    stream.querySelectorAll('.chat-thought-line.latest').forEach(prev => {
+      prev.classList.remove('latest');
+      prev.classList.add('older');
+      const caret = prev.querySelector('.caret');
+      if (caret) caret.remove();
+    });
+    const row = document.createElement('div');
+    row.className = 'chat-thought-line latest';
+    row.innerHTML = `<span class="dot"></span><span class="text"></span><span class="caret">|</span>`;
+    row.querySelector('.text').textContent = text;
+    stream.appendChild(row);
     scrollBottom();
   }
 
-  // Fade out and remove every thinking bubble accumulated this turn.
-  function vanishThoughts() {
-    const toRemove = activeThoughts.slice();
-    activeThoughts = [];
-    toRemove.forEach(el => {
-      el.classList.add('chat-thought-vanish');
-      // delay matches the CSS transition (.35s)
-      setTimeout(() => el.remove(), 380);
+  function freezeThinkingStream(stream) {
+    if (!stream) return;
+    stream.classList.add('done');
+    stream.querySelectorAll('.chat-thought-line.latest').forEach(prev => {
+      prev.classList.remove('latest');
+      prev.classList.add('older');
+      const caret = prev.querySelector('.caret');
+      if (caret) caret.remove();
     });
   }
 
@@ -1026,7 +1037,37 @@ const ChatPanel = (() => {
     if (btn) btn.disabled = true;
 
     appendMessage(text, 'user');
-    appendThought('Thinking…');
+    const stream = newThinkingStream();
+    addThinkingLine(stream, 'Thinking…');
+
+    // Assistant bubble — created lazily on first token so the empty
+    // bubble doesn't flash for tool-only responses (tools emit results,
+    // tokens come later only for the supervisor's synthesis).
+    let assistantEl = null;
+    let finalContent = '';
+
+    function ensureAssistant() {
+      if (assistantEl) return assistantEl;
+      assistantEl = document.createElement('div');
+      assistantEl.className = 'chat-msg chat-msg-assistant';
+      assistantEl.innerHTML = `<span class="chat-content"></span><span class="chat-typing-caret">|</span>`;
+      messages().appendChild(assistantEl);
+      scrollBottom();
+      return assistantEl;
+    }
+    function repaintAssistant() {
+      if (!assistantEl) return;
+      const body = assistantEl.querySelector('.chat-content');
+      if (body) body.innerHTML = renderAssistant(finalContent);
+    }
+    function finalizeAssistant(fallback) {
+      ensureAssistant();
+      if (!finalContent && fallback) finalContent = fallback;
+      const body = assistantEl.querySelector('.chat-content');
+      if (body) body.innerHTML = renderAssistant(finalContent || '(empty response)');
+      const caret = assistantEl.querySelector('.chat-typing-caret');
+      if (caret) caret.remove();
+    }
 
     try {
       const res = await fetch('/api/chat/stream', {
@@ -1041,41 +1082,67 @@ const ChatPanel = (() => {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      let currentEvent = '';
       let finalShown = false;
+      let fallbackText = '';
 
-      // Read NDJSON: one JSON object per line
+      // Parse SSE: `event: <name>\ndata: <json>\n\n`
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
-        let nl;
-        while ((nl = buffer.indexOf('\n')) >= 0) {
-          const raw = buffer.slice(0, nl).trim();
-          buffer = buffer.slice(nl + 1);
-          if (!raw) continue;
-          let evt;
-          try { evt = JSON.parse(raw); } catch { continue; }
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
 
-          if (evt.type === 'thinking') {
-            appendThought(evt.text || '…');
-          } else if (evt.type === 'final') {
-            conversationId = evt.conversation_id || conversationId;
-            vanishThoughts();
-            appendMessage(evt.response || '(empty response)', 'assistant');
-            finalShown = true;
-          } else if (evt.type === 'error') {
-            vanishThoughts();
-            appendMessage(`Error: ${evt.message || 'unknown'}`, 'assistant');
-            finalShown = true;
+        for (const rawLine of lines) {
+          const line = rawLine.replace(/\r$/, '');
+          if (line.startsWith('event: ')) {
+            currentEvent = line.slice(7).trim();
+            continue;
           }
+          if (line.startsWith('data: ')) {
+            let data;
+            try { data = JSON.parse(line.slice(6)); } catch { continue; }
+
+            if (currentEvent === 'tool_start') {
+              addThinkingLine(stream, data.label || data.tool || '…');
+            } else if (currentEvent === 'tool_result') {
+              // Specialist returned — surface a one-line acknowledgement so
+              // the stream shows it BEFORE supervisor synthesis tokens land.
+              const label = (data.tool || '').replace('ask_', '').replace('_', ' ');
+              addThinkingLine(stream, `Got ${label} reply, synthesising…`);
+              fallbackText = data.output || fallbackText;
+            } else if (currentEvent === 'token') {
+              ensureAssistant();
+              finalContent += data.token || '';
+              repaintAssistant();
+              scrollBottom();
+            } else if (currentEvent === 'final') {
+              conversationId = data.conversation_id || conversationId;
+              if (data.response && !finalContent) {
+                finalContent = data.response;
+              }
+              finalizeAssistant(data.response);
+              freezeThinkingStream(stream);
+              finalShown = true;
+            } else if (currentEvent === 'error') {
+              freezeThinkingStream(stream);
+              appendMessage(`Error: ${data.message || 'unknown'}`, 'assistant');
+              finalShown = true;
+            }
+            // currentEvent === 'done' — no payload action
+          }
+          // empty line marks end of one SSE event; just reset state
+          if (line === '') currentEvent = '';
         }
       }
+
       if (!finalShown) {
-        vanishThoughts();
-        appendMessage('(stream ended without a final response)', 'assistant');
+        freezeThinkingStream(stream);
+        finalizeAssistant(fallbackText || '(stream ended without a final response)');
       }
     } catch (err) {
-      vanishThoughts();
+      freezeThinkingStream(stream);
       appendMessage(`Error: ${err.message}`, 'assistant');
     } finally {
       inp.disabled = false;

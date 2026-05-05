@@ -707,13 +707,17 @@ def _friendly_tool_event(name: str, input_data: dict) -> str | None:
 
 @app.post("/api/chat/stream")
 async def chat_stream(req: ChatRequest):
-    """Streaming variant of /api/chat — emits NDJSON events:
+    """Stream a chat response as SSE — mirrors the ReconX shape exactly.
 
-      {"type":"thinking","text":"…"}        (one per significant tool call)
-      {"type":"final","response":"…", ...}  (final assistant message)
-      {"type":"error","message":"…"}        (terminal failure)
+    Events emitted (SSE format `event: <name>\\ndata: <JSON>\\n\\n`):
 
-    Frontend reads chunks and renders thinking bubbles in real time.
+      tool_start  — {"tool": "<name>", "label": "<friendly thinking line>"}
+      tool_result — {"tool": "ask_*",  "output": "<truncated specialist output>"}
+      token       — {"token": "<incremental supervisor text>"}
+      final       — {"response": "<full text>", "conversation_id": "...",
+                     "specialist_used": "...", "duration_ms": N}
+      done        — {}
+      error       — {"message": "..."}
     """
     import time
     from fastapi.responses import StreamingResponse  # noqa: WPS433
@@ -732,63 +736,93 @@ async def chat_stream(req: ChatRequest):
 
             from langchain_core.messages import AIMessage, HumanMessage  # noqa: WPS433
 
-            messages = history + [HumanMessage(content=req.message)]
+            user_msg = HumanMessage(content=req.message)
+            messages = history + [user_msg]
 
+            # Track active ask_* delegations by run_id; while any is in flight,
+            # suppress supervisor token events (they are usually empty padding
+            # while the specialist runs anyway).
+            active_delegations: set[str] = set()
             specialist_used = "unknown"
             final_text = ""
 
-            async for event in agent.astream_events({"messages": messages}, version="v2"):
-                etype = event.get("event")
-                if etype == "on_tool_start":
-                    name = event.get("name", "")
-                    data = event.get("data", {}) or {}
-                    line = _friendly_tool_event(name, data.get("input") or {})
-                    if name in {"ask_lineage_search", "ask_impact_analyst"}:
-                        specialist_used = (
-                            "both"
-                            if specialist_used not in {"unknown", name.replace("ask_", "")}
-                            else name.replace("ask_", "")
-                        )
-                    if line:
-                        yield _json.dumps({"type": "thinking", "text": line}, ensure_ascii=False) + "\n"
-                elif etype == "on_chain_end":
-                    out = (event.get("data") or {}).get("output") or {}
-                    msgs = out.get("messages") if isinstance(out, dict) else None
-                    if isinstance(msgs, list):
-                        for m in reversed(msgs):
-                            content = getattr(m, "content", None)
-                            tc = getattr(m, "tool_calls", None)
-                            if isinstance(content, str) and content.strip() and not tc:
-                                final_text = content
-                                break
-                            if isinstance(content, list) and not tc:
-                                buf = []
-                                for blk in content:
-                                    if isinstance(blk, dict) and blk.get("type") == "text":
-                                        buf.append(blk.get("text", ""))
-                                joined = "".join(buf).strip()
-                                if joined:
-                                    final_text = joined
-                                    break
+            def sse(event_name: str, payload: dict) -> str:
+                return f"event: {event_name}\ndata: {_json.dumps(payload, ensure_ascii=False)}\n\n"
 
+            async for event in agent.astream_events({"messages": messages}, version="v2"):
+                kind = event.get("event")
+                name = event.get("name") or ""
+
+                if kind == "on_tool_start":
+                    data = event.get("data") or {}
+                    label = _friendly_tool_event(name, data.get("input") or {})
+                    if name.startswith("ask_"):
+                        run_id = event.get("run_id", "")
+                        active_delegations.add(run_id)
+                        if name == "ask_lineage_search":
+                            specialist_used = (
+                                "both" if specialist_used == "impact_analyst" else "lineage_search"
+                            )
+                        elif name == "ask_impact_analyst":
+                            specialist_used = (
+                                "both" if specialist_used == "lineage_search" else "impact_analyst"
+                            )
+                    if label:
+                        yield sse("tool_start", {"tool": name, "label": label})
+
+                elif kind == "on_tool_end" and name.startswith("ask_"):
+                    run_id = event.get("run_id", "")
+                    active_delegations.discard(run_id)
+                    raw = (event.get("data") or {}).get("output", "")
+                    if hasattr(raw, "content"):
+                        out = raw.content
+                    else:
+                        out = raw
+                    if isinstance(out, list):
+                        out = "".join(
+                            b.get("text", "") for b in out
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        ) or str(out)
+                    elif not isinstance(out, str):
+                        out = str(out)
+                    if len(out) > 2000:
+                        out = out[:2000] + "\n... (truncated)"
+                    yield sse("tool_result", {"tool": name, "output": out})
+
+                elif kind == "on_chat_model_stream" and not active_delegations:
+                    chunk = (event.get("data") or {}).get("chunk")
+                    text = ""
+                    if chunk is not None:
+                        c = getattr(chunk, "content", None)
+                        if isinstance(c, str):
+                            text = c
+                        elif isinstance(c, list):
+                            for blk in c:
+                                if isinstance(blk, dict) and blk.get("type") == "text":
+                                    text += blk.get("text", "")
+                    if text:
+                        final_text += text
+                        yield sse("token", {"token": text})
+
+            # Persist conversation state — only the human turn + final AI msg.
             _chat_histories[conv_id] = messages + [AIMessage(content=final_text)]
-            yield _json.dumps({
-                "type": "final",
+
+            yield sse("final", {
                 "response": final_text or "(no response)",
                 "conversation_id": conv_id,
                 "specialist_used": specialist_used,
                 "duration_ms": int((time.perf_counter() - started) * 1000),
-            }, ensure_ascii=False) + "\n"
+            })
+            yield sse("done", {})
 
         except Exception as exc:
-            yield _json.dumps({
-                "type": "error",
-                "message": f"The lineage agent encountered an error: {exc}",
-                "conversation_id": conv_id,
-                "duration_ms": int((time.perf_counter() - started) * 1000),
-            }, ensure_ascii=False) + "\n"
+            yield (
+                f"event: error\ndata: "
+                f"{_json.dumps({'message': f'The lineage agent encountered an error: {exc}'}, ensure_ascii=False)}\n\n"
+            )
+            yield "event: done\ndata: {}\n\n"
 
-    return StreamingResponse(gen(), media_type="application/x-ndjson")
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.post("/api/chat")

@@ -1,0 +1,4 @@
+Where is customer risk score stored?
+What breaks if I rename src_customer.ssn_hash?
+Show me everything about KYC status
+What depends on stg_fx_resolved.rate?
