@@ -387,6 +387,44 @@ class GraphBuilder:
             pass
         return ""
 
+    def _upsert_column_stub(
+        self,
+        column_name: str,
+        dataset_name: str,
+        computed_at: str,
+    ) -> None:
+        """Source-side stub upsert.
+
+        Used when ingesting a target column's edges: we need the source-column
+        node to exist so the DERIVES_FROM edge has both endpoints, but we must
+        NOT overwrite the rich properties (expression, transform_type, confidence,
+        data_type, sql_hash, semantic_description) that the source's own
+        producing stage may have already written. Hence ON CREATE SET only.
+        """
+        ts = computed_at or _utc_now_iso()
+        pk = _column_pk(column_name, dataset_name)
+        self.conn.execute(
+            f"""
+            MERGE (c:{COL} {{pk: $pk}})
+            ON CREATE SET c.column_name          = $column_name,
+                          c.dataset_name         = $dataset_name,
+                          c.derivation           = '',
+                          c.computed_at          = $computed_at,
+                          c.expression           = '',
+                          c.transform_type       = '',
+                          c.confidence           = 0.0,
+                          c.data_type            = '',
+                          c.sql_hash             = '',
+                          c.semantic_description = ''
+            """,
+            {
+                "pk": pk,
+                "column_name": column_name,
+                "dataset_name": dataset_name,
+                "computed_at": ts,
+            },
+        )
+
     # ------------------------------------------------------------------
     # Edge upserts
     # ------------------------------------------------------------------
@@ -456,7 +494,7 @@ class GraphBuilder:
                 if src_table == manifest.target_table and src_col == col_name:
                     continue  # self-reference
 
-                self._upsert_column(src_col, src_table, "", manifest.ts, semantic_description=None)
+                self._upsert_column_stub(src_col, src_table, manifest.ts)
                 self._upsert_column(col_name, manifest.target_table, derivation, manifest.ts, semantic_description=None)
 
                 created = self._safe_merge_rel(
@@ -620,18 +658,12 @@ class GraphBuilder:
             if edge.source_table == target_table and edge.source_column == target_col:
                 continue  # self-reference
 
-            # Source side — stub. Don't overwrite a richer node if one already exists.
-            self._upsert_column(
+            # Source side — create-only stub so we don't wipe properties the
+            # source's own producing stage already wrote.
+            self._upsert_column_stub(
                 column_name=edge.source_column,
                 dataset_name=edge.source_table,
-                derivation="",
                 computed_at=ts,
-                expression="",
-                transform_type="",
-                confidence=None,
-                data_type="",
-                sql_hash="",
-                semantic_description=None,
             )
 
             created = self._safe_merge_rel(
