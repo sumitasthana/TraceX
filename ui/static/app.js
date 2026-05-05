@@ -570,7 +570,8 @@ const App = (() => {
         if (node.nodeKind === 'DataSet') {
           await showDataset({ label: node.label, layer: node.layer, row_count: 0 });
           await toggleDatasetColumns(id, node.label);
-          ChatPanel.suggestDataset(node.label);
+          // (Discover navigation hook intentionally not auto-fired here —
+          //  use the toolbar to open Discover with a question instead.)
         } else if (node.nodeKind === 'Column' || node.nodeKind === 'ColumnUpstream') {
           // recover (table, column) — Column nodes have label = column,
           // and we stashed the parent dataset via the owns:: edge target.
@@ -878,6 +879,7 @@ const App = (() => {
     { match: /^#\/lineage$/,                        view: () => viewLineage(),                       nav: 'lineage' },
     { match: /^#\/datasets$/,                       view: () => viewDatasets(),                      nav: 'datasets' },
     { match: /^#\/dq$/,                             view: () => viewDQ(),                            nav: 'dq' },
+    { match: /^#\/discover$/,                       view: () => Discover.render(),                   nav: 'discover' },
   ];
 
   function setActiveNav(name) {
@@ -914,16 +916,17 @@ const App = (() => {
 })();
 
 // =====================================================================
-// Chat Panel — slide-in drawer wired to /api/chat
+// Discover — full-page data discovery + impact intelligence
 // =====================================================================
-const ChatPanel = (() => {
+const Discover = (() => {
   let conversationId = null;
-  let isOpen = false;
-
-  function drawer()   { return document.getElementById('chat-drawer'); }
-  function messages() { return document.getElementById('chat-messages'); }
-  function input()    { return document.getElementById('chat-input'); }
-  function sendBtn()  { return document.querySelector('.chat-send-btn'); }
+  let pendingPrefill = '';   // text staged by other views (e.g. Lineage Explorer dataset click)
+  let activeStream = null;   // current ThinkingStream container (per turn)
+  let convEl = null;         // conversation container
+  let refsEl = null;         // references panel
+  let messages = [];         // [{role, content}] for in-page render only
+  const refIndex = new Map(); // table.column -> {table, column, layer?}
+  const tableRefs = new Set();
 
   function escHtml(s) {
     return String(s ?? '').replace(/[&<>"']/g, c =>
@@ -931,66 +934,207 @@ const ChatPanel = (() => {
     );
   }
 
-  function toggle() {
-    isOpen = !isOpen;
-    const d = drawer();
-    if (!d) return;
-    d.classList.toggle('open',   isOpen);
-    d.classList.toggle('closed', !isOpen);
-    if (isOpen) setTimeout(() => input()?.focus(), 280);
+  // Other views call this BEFORE navigating to #/discover. The query is
+  // staged and surfaces in the search input on the next render().
+  function prefill(query) {
+    pendingPrefill = String(query || '');
+  }
+
+  // Navigate to the Discover page with a pre-filled query.
+  function open(query) {
+    if (query) prefill(query);
+    if (location.hash !== '#/discover') {
+      location.hash = '#/discover';
+    } else {
+      // Already on the page — re-render to surface the prefill.
+      Discover.render();
+    }
+  }
+
+  // ── Empty state: hero + categorised prompt cards ──────────────────
+  const CATEGORIES = [
+    {
+      key: 'discovery',
+      icon: 'D',
+      title: 'Discovery',
+      sub: 'Find tables and columns by business concept.',
+      prompts: [
+        'Where is customer risk score stored?',
+        'Show me everything about KYC status',
+        'What does kyc_stale_flag mean?',
+        'Where is transaction volume tracked?',
+      ],
+    },
+    {
+      key: 'impact',
+      icon: 'I',
+      title: 'Impact Analysis',
+      sub: 'See what breaks if a column changes.',
+      prompts: [
+        'What breaks if I rename src_customer.ssn_hash?',
+        'Impact of dropping stg_fx_resolved.rate',
+        'What depends on src_customer.kyc_status?',
+        'If I change src_transaction.amount to INTEGER, what breaks?',
+      ],
+    },
+    {
+      key: 'explore',
+      icon: 'E',
+      title: 'Explore by table',
+      sub: 'Inspect a table’s columns and definitions.',
+      prompts: [
+        'What’s in fct_customer_risk_profile?',
+        'Show me the FX rate columns',
+        'Which columns are in stg_transaction_normalized?',
+        'What data do we have about reversals?',
+      ],
+    },
+  ];
+
+  function renderEmptyBody() {
+    return `
+      <div class="discover-cats">
+        ${CATEGORIES.map(c => `
+          <div class="discover-cat">
+            <div class="cat-head">
+              <div class="cat-icon cat-${escHtml(c.key)}">${escHtml(c.icon)}</div>
+              <div>
+                <div class="cat-title">${escHtml(c.title)}</div>
+              </div>
+            </div>
+            <div class="cat-sub">${escHtml(c.sub)}</div>
+            ${c.prompts.map(p => `
+              <button type="button" class="cat-prompt" data-prompt="${escHtml(p)}">${escHtml(p)}</button>
+            `).join('')}
+          </div>
+        `).join('')}
+      </div>`;
+  }
+
+  function attachPromptHandlers(scope) {
+    scope.querySelectorAll('[data-prompt]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const text = btn.dataset.prompt || '';
+        const inp = scope.querySelector('#discover-input');
+        if (inp) inp.value = text;
+        send(text);
+      });
+    });
+  }
+
+  // ── Page render ───────────────────────────────────────────────────
+  function render() {
+    const root = document.getElementById('page-root');
+    if (!root) return;
+
+    const initialQuery = pendingPrefill;
+    pendingPrefill = '';
+
+    root.innerHTML = `
+      <div class="discover-shell animate-fadein">
+        <div class="discover-hero">
+          <div class="lead">Discover</div>
+          <div class="sub">Ask about your data lineage in plain language. Powered by the lineage and impact specialists.</div>
+          <form id="discover-form" class="discover-search" autocomplete="off">
+            <span class="magnifier">⌕</span>
+            <input id="discover-input" type="text" placeholder="Ask anything about your data…" />
+            <button id="discover-submit" type="submit">Ask</button>
+          </form>
+        </div>
+
+        <div id="discover-empty">${renderEmptyBody()}</div>
+
+        <div id="discover-active" class="discover-active" style="display:none">
+          <div id="discover-conversation" class="discover-conversation"></div>
+          <aside id="discover-refs" class="discover-refs">
+            <h3>Referenced columns</h3>
+            <div id="discover-refs-cols"><div class="empty">Mentioned columns will appear here.</div></div>
+            <h3 style="margin-top:14px">Referenced tables</h3>
+            <div id="discover-refs-tbls"><div class="empty">Mentioned tables will appear here.</div></div>
+          </aside>
+        </div>
+      </div>
+    `;
+
+    convEl = root.querySelector('#discover-conversation');
+    refsEl = root.querySelector('#discover-refs');
+
+    const form = root.querySelector('#discover-form');
+    const inp  = root.querySelector('#discover-input');
+
+    if (initialQuery) inp.value = initialQuery;
+
+    form.addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      const q = (inp.value || '').trim();
+      if (!q) return;
+      send(q);
+    });
+
+    attachPromptHandlers(root);
+
+    // Re-render any prior conversation in the same session if we already
+    // had messages (e.g. user navigated away and back without a hard reload).
+    if (messages.length > 0) {
+      switchToActive();
+      messages.forEach(m => {
+        if (m.role === 'user') appendUserMessage(m.content);
+        else if (m.role === 'assistant') appendAssistantInline(m.content);
+      });
+      // (Old turns drop their thinking streams; not preserved across renders.)
+      renderRefs();
+    }
+
+    setTimeout(() => inp.focus(), 50);
+  }
+
+  function switchToActive() {
+    const empty = document.getElementById('discover-empty');
+    const active = document.getElementById('discover-active');
+    if (empty) empty.style.display = 'none';
+    if (active) active.style.display = '';
+  }
+
+  // ── Conversation rendering ────────────────────────────────────────
+  function appendUserMessage(text) {
+    const el = document.createElement('div');
+    el.className = 'disc-msg-user';
+    el.textContent = text;
+    convEl.appendChild(el);
+    convEl.scrollTop = convEl.scrollHeight;
+  }
+
+  function appendAssistantInline(text) {
+    const el = document.createElement('div');
+    el.className = 'disc-msg-assistant';
+    el.innerHTML = renderAssistant(text);
+    convEl.appendChild(el);
+    convEl.scrollTop = convEl.scrollHeight;
+    return el;
   }
 
   // Render assistant message: highlight `table.column` patterns as chips,
-  // convert **bold** to <strong>, convert newlines to <br>, basic numbered lists.
+  // convert **bold** to <strong>, convert newlines to <br>.
   function renderAssistant(text) {
     let s = escHtml(text);
-    // **bold**
     s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    // `table.column` or `column_name` → teal chip
     s = s.replace(/`([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?)`/gi,
       '<span class="col-ref">$1</span>');
-    // newlines
     s = s.replace(/\n/g, '<br>');
     return s;
   }
 
-  function appendMessage(text, role) {
-    const el = document.createElement('div');
-    el.className = `chat-msg chat-msg-${role}`;
-    if (role === 'assistant') {
-      el.innerHTML = renderAssistant(text);
-    } else {
-      el.textContent = text;
-    }
-    messages().appendChild(el);
-    scrollBottom();
-    return el;
-  }
-
-  function appendThinking() {
-    const el = document.createElement('div');
-    el.className = 'chat-msg-thinking';
-    el.textContent = 'Searching lineage graph…';
-    messages().appendChild(el);
-    scrollBottom();
-    return el;
-  }
-
-  // ReconX ThinkingStream pattern: a per-turn vertical stream of thought
-  // lines. The latest line shows a pulsating green dot + blinking cursor;
-  // older lines fade to 0.55 opacity. The whole stream stays visible
-  // alongside the final answer so the user can see what the agent did.
-
+  // Per-turn thinking stream — appended to the conversation flow.
   function newThinkingStream() {
     const el = document.createElement('div');
     el.className = 'chat-thinking-stream';
-    messages().appendChild(el);
+    convEl.appendChild(el);
+    convEl.scrollTop = convEl.scrollHeight;
     return el;
   }
 
   function addThinkingLine(stream, text) {
     if (!stream) return;
-    // Demote any prior "latest" line to "older"
     stream.querySelectorAll('.chat-thought-line.latest').forEach(prev => {
       prev.classList.remove('latest');
       prev.classList.add('older');
@@ -1002,7 +1146,7 @@ const ChatPanel = (() => {
     row.innerHTML = `<span class="dot"></span><span class="text"></span><span class="caret">|</span>`;
     row.querySelector('.text').textContent = text;
     stream.appendChild(row);
-    scrollBottom();
+    convEl.scrollTop = convEl.scrollHeight;
   }
 
   function freezeThinkingStream(stream) {
@@ -1016,43 +1160,114 @@ const ChatPanel = (() => {
     });
   }
 
-  function scrollBottom() {
-    const m = messages();
-    if (m) m.scrollTop = m.scrollHeight;
+  // ── References extraction ─────────────────────────────────────────
+  // Pull `table.column` and `bare_table_name` patterns out of assistant
+  // text and surface them in the right-hand panel as clickable cards.
+  const KNOWN_TABLES = [
+    'src_branch', 'src_customer', 'src_account', 'src_transaction', 'src_fx_rate',
+    'stg_fx_resolved', 'stg_transaction_normalized', 'stg_customer_enriched',
+    'fct_customer_risk_profile',
+  ];
+
+  function inferLayer(table) {
+    if (!table) return '';
+    if (table.startsWith('src_')) return 'layer_0';
+    if (table.startsWith('stg_')) return 'layer_1';
+    if (table.startsWith('fct_') || table.startsWith('dim_')) return 'layer_2';
+    return '';
   }
 
-  async function sendText(text) {
-    const inp = input();
-    if (inp) inp.value = text;
-    await send();
-  }
-
-  async function send() {
-    const inp = input();
-    const btn = sendBtn();
-    const text = (inp?.value || '').trim();
+  function harvestReferences(text) {
     if (!text) return;
-    inp.value = '';
-    inp.disabled = true;
-    if (btn) btn.disabled = true;
+    const tableColRe = /`([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)`/gi;
+    let m;
+    while ((m = tableColRe.exec(text)) !== null) {
+      const [t, c] = [m[1], m[2]];
+      const key = `${t}.${c}`;
+      if (!refIndex.has(key)) {
+        refIndex.set(key, { table: t, column: c, layer: inferLayer(t) });
+      }
+    }
+    // Bare table names — only surface ones we know about
+    KNOWN_TABLES.forEach(t => {
+      const re = new RegExp(`\\b${t}\\b`, 'i');
+      if (re.test(text)) tableRefs.add(t);
+    });
+  }
 
-    appendMessage(text, 'user');
+  function renderRefs() {
+    if (!refsEl) return;
+    const cols = refsEl.querySelector('#discover-refs-cols');
+    const tbls = refsEl.querySelector('#discover-refs-tbls');
+    if (!cols || !tbls) return;
+
+    if (refIndex.size === 0) {
+      cols.innerHTML = `<div class="empty">Mentioned columns will appear here.</div>`;
+    } else {
+      cols.innerHTML = Array.from(refIndex.values()).map(r => `
+        <button type="button" class="ref-card"
+                data-table="${escHtml(r.table)}" data-column="${escHtml(r.column)}">
+          <div class="ref-mono">${escHtml(r.table)}.${escHtml(r.column)}</div>
+          <div class="ref-meta">
+            <span class="ref-tag">${escHtml(r.layer || '?')}</span>
+            <span>open in Lineage</span>
+          </div>
+        </button>
+      `).join('');
+      cols.querySelectorAll('.ref-card').forEach(btn => {
+        btn.addEventListener('click', () => {
+          location.hash = '#/lineage';
+        });
+      });
+    }
+
+    if (tableRefs.size === 0) {
+      tbls.innerHTML = `<div class="empty">Mentioned tables will appear here.</div>`;
+    } else {
+      tbls.innerHTML = Array.from(tableRefs).map(t => `
+        <button type="button" class="ref-card" data-table="${escHtml(t)}">
+          <div class="ref-mono">${escHtml(t)}</div>
+          <div class="ref-meta">
+            <span class="ref-tag">${escHtml(inferLayer(t) || '?')}</span>
+            <span>open in Lineage</span>
+          </div>
+        </button>
+      `).join('');
+      tbls.querySelectorAll('.ref-card').forEach(btn => {
+        btn.addEventListener('click', () => { location.hash = '#/lineage'; });
+      });
+    }
+  }
+
+  // ── Send / SSE consumption ────────────────────────────────────────
+  async function send(rawText) {
+    const text = String(rawText || '').trim();
+    if (!text) return;
+    if (!convEl) return; // page not rendered yet
+
+    switchToActive();
+
+    const inp = document.getElementById('discover-input');
+    const submitBtn = document.getElementById('discover-submit');
+    if (inp) { inp.value = ''; inp.disabled = true; }
+    if (submitBtn) submitBtn.disabled = true;
+
+    messages.push({ role: 'user', content: text });
+    appendUserMessage(text);
+
     const stream = newThinkingStream();
     addThinkingLine(stream, 'Thinking…');
 
-    // Assistant bubble — created lazily on first token so the empty
-    // bubble doesn't flash for tool-only responses (tools emit results,
-    // tokens come later only for the supervisor's synthesis).
     let assistantEl = null;
     let finalContent = '';
 
     function ensureAssistant() {
       if (assistantEl) return assistantEl;
       assistantEl = document.createElement('div');
-      assistantEl.className = 'chat-msg chat-msg-assistant';
+      assistantEl.className = 'disc-msg-assistant';
       assistantEl.innerHTML = `<span class="chat-content"></span><span class="chat-typing-caret">|</span>`;
-      messages().appendChild(assistantEl);
-      scrollBottom();
+      convEl.appendChild(assistantEl);
+      convEl.scrollTop = convEl.scrollHeight;
       return assistantEl;
     }
     function repaintAssistant() {
@@ -1067,6 +1282,9 @@ const ChatPanel = (() => {
       if (body) body.innerHTML = renderAssistant(finalContent || '(empty response)');
       const caret = assistantEl.querySelector('.chat-typing-caret');
       if (caret) caret.remove();
+      messages.push({ role: 'assistant', content: finalContent || '' });
+      harvestReferences(finalContent);
+      renderRefs();
     }
 
     try {
@@ -1075,9 +1293,7 @@ const ChatPanel = (() => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text, conversation_id: conversationId }),
       });
-      if (!res.ok || !res.body) {
-        throw new Error(`HTTP ${res.status}`);
-      }
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -1086,7 +1302,6 @@ const ChatPanel = (() => {
       let finalShown = false;
       let fallbackText = '';
 
-      // Parse SSE: `event: <name>\ndata: <json>\n\n`
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -1107,62 +1322,53 @@ const ChatPanel = (() => {
             if (currentEvent === 'tool_start') {
               addThinkingLine(stream, data.label || data.tool || '…');
             } else if (currentEvent === 'tool_result') {
-              // Specialist returned — surface a one-line acknowledgement so
-              // the stream shows it BEFORE supervisor synthesis tokens land.
               const label = (data.tool || '').replace('ask_', '').replace('_', ' ');
               addThinkingLine(stream, `Got ${label} reply, synthesising…`);
               fallbackText = data.output || fallbackText;
+              harvestReferences(data.output || '');
+              renderRefs();
             } else if (currentEvent === 'token') {
               ensureAssistant();
               finalContent += data.token || '';
               repaintAssistant();
-              scrollBottom();
+              convEl.scrollTop = convEl.scrollHeight;
             } else if (currentEvent === 'final') {
               conversationId = data.conversation_id || conversationId;
-              if (data.response && !finalContent) {
-                finalContent = data.response;
-              }
+              if (data.response && !finalContent) finalContent = data.response;
               finalizeAssistant(data.response);
               freezeThinkingStream(stream);
               finalShown = true;
             } else if (currentEvent === 'error') {
               freezeThinkingStream(stream);
-              appendMessage(`Error: ${data.message || 'unknown'}`, 'assistant');
+              const errEl = document.createElement('div');
+              errEl.className = 'disc-msg-assistant';
+              errEl.style.color = 'var(--red)';
+              errEl.textContent = `Error: ${data.message || 'unknown'}`;
+              convEl.appendChild(errEl);
               finalShown = true;
             }
-            // currentEvent === 'done' — no payload action
           }
-          // empty line marks end of one SSE event; just reset state
           if (line === '') currentEvent = '';
         }
       }
-
       if (!finalShown) {
         freezeThinkingStream(stream);
         finalizeAssistant(fallbackText || '(stream ended without a final response)');
       }
     } catch (err) {
       freezeThinkingStream(stream);
-      appendMessage(`Error: ${err.message}`, 'assistant');
+      const errEl = document.createElement('div');
+      errEl.className = 'disc-msg-assistant';
+      errEl.style.color = 'var(--red)';
+      errEl.textContent = `Error: ${err.message}`;
+      convEl.appendChild(errEl);
     } finally {
-      inp.disabled = false;
-      if (btn) btn.disabled = false;
-      inp.focus();
+      if (inp) { inp.disabled = false; inp.focus(); }
+      if (submitBtn) submitBtn.disabled = false;
     }
   }
 
-  // Pre-populate the chat from the Lineage Explorer when a DataSet node is
-  // clicked. Opens the drawer if closed, fills the input but does NOT send.
-  function suggestDataset(datasetName) {
-    if (!isOpen) toggle();
-    const inp = input();
-    if (!inp) return;
-    inp.value = `Tell me about the ${datasetName} table`;
-    inp.focus();
-    inp.setSelectionRange(inp.value.length, inp.value.length);
-  }
-
-  return { toggle, send, sendText, suggestDataset };
+  return { render, send, prefill, open };
 })();
 
 window.addEventListener('hashchange', App.dispatch);
