@@ -1,0 +1,12 @@
+{
+  "name": "anthropic-proxy-lambda",
+  "version": "1.0.0",
+  "description": "AWS Lambda proxy for Anthropic API",
+  "main": "anthropic-proxy.js",
+  "scripts": {
+    "package": "zip -r function.zip anthropic-proxy.js"
+  },
+  "keywords": ["lambda", "anthropic", "proxy"],
+  "author": "",
+  "license": "MIT"
+}

@@ -461,11 +461,51 @@ class GraphBuilder:
         node to exist so the DERIVES_FROM edge has both endpoints, but we must
         NOT overwrite the rich properties (expression, transform_type, confidence,
         data_type, sql_hash, semantic_description, source, review_state) that
-        the source's own producing stage may have already written. Hence
-        ON CREATE SET only.
+        the source's own producing stage may have already written.
+
+        Special-case: columns that live in a `src_*` (Layer 0) table are
+        source-of-record by definition — no derivation, no agent inference,
+        nothing to ratify. We tag them `source=catalog` / `review_state=ratified`
+        and `confidence=1.0` on both CREATE and MATCH, so existing UNRESOLVED
+        nodes self-heal on the next pipeline run.
         """
         ts = computed_at or _utc_now_iso()
         pk = _column_pk(column_name, dataset_name)
+        is_source_table = dataset_name.startswith("src_")
+        params = {
+            "pk": pk,
+            "column_name": column_name,
+            "dataset_name": dataset_name,
+            "computed_at": ts,
+        }
+
+        if is_source_table:
+            # Source-of-record: force catalog/ratified on every ingest.
+            self.conn.execute(
+                f"""
+                MERGE (c:{COL} {{pk: $pk}})
+                ON CREATE SET c.column_name          = $column_name,
+                              c.dataset_name         = $dataset_name,
+                              c.derivation           = '',
+                              c.computed_at          = $computed_at,
+                              c.expression           = '',
+                              c.transform_type       = 'PASSTHROUGH',
+                              c.confidence           = 1.0,
+                              c.data_type            = '',
+                              c.sql_hash             = '',
+                              c.semantic_description = '',
+                              c.source               = 'catalog',
+                              c.review_state         = 'ratified'
+                ON MATCH  SET c.source               = 'catalog',
+                              c.review_state         = 'ratified',
+                              c.confidence           = 1.0
+                """,
+                params,
+            )
+            return
+
+        # Non-source stub: preserve rich properties on MATCH (the producing
+        # stage's writes win). Initialise as unresolved/pending on CREATE.
         self.conn.execute(
             f"""
             MERGE (c:{COL} {{pk: $pk}})
@@ -482,12 +522,7 @@ class GraphBuilder:
                           c.source               = 'unresolved',
                           c.review_state         = 'pending_review'
             """,
-            {
-                "pk": pk,
-                "column_name": column_name,
-                "dataset_name": dataset_name,
-                "computed_at": ts,
-            },
+            params,
         )
 
     # ------------------------------------------------------------------
