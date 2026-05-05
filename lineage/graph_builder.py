@@ -737,8 +737,15 @@ class GraphBuilder:
         }
 
     def close(self) -> None:
+        """Release every Kuzu resource so other code (notably enrichment-agent
+        tools that re-open the database) can grab the file lock without
+        conflict. Closing only the Connection isn't enough — the Database
+        object holds the lock until it is garbage-collected.
+        """
         try:
-            if hasattr(self.conn, "close"):
+            if self.conn is not None and hasattr(self.conn, "close"):
                 self.conn.close()
         finally:
+            self.conn = None
+            self.db = None
             self.log.info("graph_builder_closed")

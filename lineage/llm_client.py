@@ -29,11 +29,20 @@ DEFAULT_MAX_TOKENS = 4096
 
 
 def _bedrock_region() -> str:
-    return os.environ.get("TRACEX_BEDROCK_REGION") or os.environ.get("AWS_BEDROCK_REGION") or os.environ.get("AWS_REGION") or DEFAULT_REGION
+    return (
+        os.environ.get("TRACEX_BEDROCK_REGION")
+        or os.environ.get("AWS_BEDROCK_REGION")
+        or os.environ.get("AWS_REGION")
+        or DEFAULT_REGION
+    )
 
 
 def _bedrock_model() -> str:
-    return os.environ.get("TRACEX_BEDROCK_MODEL", DEFAULT_MODEL)
+    return (
+        os.environ.get("TRACEX_BEDROCK_MODEL")
+        or os.environ.get("AWS_BEDROCK_MODEL")
+        or DEFAULT_MODEL
+    )
 
 
 def _max_tokens() -> int:

@@ -5,7 +5,7 @@ from typing import Optional
 
 from langchain_core.tools import tool
 
-from lineage.config import get_db, get_conn
+from lineage.agents._kuzu_pool import get_shared_conn
 
 # Backtick-escape — `Column` is reserved in Kuzu's parser.
 COL = "`Column`"
@@ -16,7 +16,7 @@ def _column_pk(column_name: str, dataset_name: str) -> str:
 
 
 def _open_conn():
-    return get_conn(get_db())
+    return get_shared_conn()
 
 
 @tool

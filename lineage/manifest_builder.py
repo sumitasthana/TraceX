@@ -330,6 +330,7 @@ def build_and_ingest(
     )
 
     # 3. Graph ingest — wrapped so failure here doesn't crash the stage.
+    builder = None
     try:
         builder = GraphBuilder(run_id=run_id)
         try:
@@ -346,6 +347,12 @@ def build_and_ingest(
             traceback=traceback.format_exc(),
         )
         # Fall through — emit the summary log so the run still has a paper trail.
+
+    # Drop our reference and force a GC pass so the Kuzu Database file lock is
+    # released BEFORE the enrichment loop starts opening its own connections.
+    builder = None
+    import gc as _gc
+    _gc.collect()
 
     # 4. Enrichment — only on resolved maps with confidence >= 0.5.
     if not skip_enrichment:
@@ -379,11 +386,10 @@ def build_and_ingest(
 
 def _enrichment_disabled_via_env() -> bool:
     import os
-    # Master kill-switch for ALL Bedrock-backed agents. Default OFF so the
-    # deterministic path runs cleanly without AWS creds. Flip to "on" once
-    # creds are confirmed.
-    master = os.environ.get("TRACEX_LINEAGE_AGENTS", "off").strip().lower()
-    if master in {"0", "false", "no", "off", "disabled", ""}:
+    # Master kill-switch for all Bedrock-backed agents. Default ON now that
+    # .env supplies AWS creds. Set TRACEX_LINEAGE_AGENTS=off to disable.
+    master = os.environ.get("TRACEX_LINEAGE_AGENTS", "on").strip().lower()
+    if master in {"0", "false", "no", "off", "disabled"}:
         return True
     val = os.environ.get("TRACEX_LINEAGE_ENRICHMENT", "").strip().lower()
     return val in {"0", "false", "no", "off", "disabled"}
@@ -391,8 +397,8 @@ def _enrichment_disabled_via_env() -> bool:
 
 def _resolution_disabled_via_env() -> bool:
     import os
-    master = os.environ.get("TRACEX_LINEAGE_AGENTS", "off").strip().lower()
-    if master in {"0", "false", "no", "off", "disabled", ""}:
+    master = os.environ.get("TRACEX_LINEAGE_AGENTS", "on").strip().lower()
+    if master in {"0", "false", "no", "off", "disabled"}:
         return True
     val = os.environ.get("TRACEX_LINEAGE_RESOLVE", "").strip().lower()
     return val in {"0", "false", "no", "off", "disabled"}
