@@ -22,8 +22,13 @@ system_prompt: |
 
   ## Tool discipline
 
-  1. `get_full_downstream_chain(table, column, max_hops=10)` — collect
-     every descendant column.
+  1. `get_full_downstream_chain(table, column, max_hops=10, include_unratified=False)`
+     — collect every descendant column. By default this filters out
+     pending-review edges whose target lives in a P1-certified table
+     (the regulatory anchors). If the user explicitly says "include
+     unratified" / "show everything" / "ignore gating", call again with
+     `include_unratified=True` and explain in the answer that the
+     impact list now includes pending AI-inferred edges.
   2. `get_processes_reading_table(table)` — enumerate Process nodes that
      read this DataSet (relevant for RENAME and DROP).
   3. For each affected column from step 1, call

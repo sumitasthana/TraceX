@@ -395,6 +395,7 @@ def lineage_dataset_columns(name: str):
         RETURN col.column_name, col.transform_type, col.confidence,
                col.data_type, col.expression, col.semantic_description,
                col.derivation, col.sql_hash, col.computed_at,
+               col.source, col.review_state,
                count(d) AS source_count
         ORDER BY col.column_name
         """,
@@ -413,7 +414,9 @@ def lineage_dataset_columns(name: str):
             "derivation": r[6] or "",
             "sql_hash": r[7] or "",
             "computed_at": r[8] or "",
-            "source_count": int(r[9]) if r[9] is not None else 0,
+            "source": r[9] or "unresolved",
+            "review_state": r[10] or "pending_review",
+            "source_count": int(r[11]) if r[11] is not None else 0,
         })
     return {"table": name, "columns": out}
 
@@ -428,7 +431,7 @@ def lineage_column(table: str, column: str):
         MATCH (n:{COL_LABEL} {{pk: $pk}})
         RETURN n.column_name, n.dataset_name, n.expression,
                n.transform_type, n.confidence, n.data_type,
-               n.semantic_description, n.sql_hash
+               n.semantic_description, n.sql_hash, n.source, n.review_state
         """,
         {"pk": pk},
     )
@@ -444,6 +447,8 @@ def lineage_column(table: str, column: str):
         "data_type": row[5] or "",
         "semantic_description": row[6] or "",
         "sql_hash": row[7] or "",
+        "source": row[8] or "unresolved",
+        "review_state": row[9] or "pending_review",
     }
 
     chain_q = c.execute(
@@ -452,7 +457,8 @@ def lineage_column(table: str, column: str):
                      -[:DERIVES_FROM*1..10]->(src:{COL_LABEL})
         RETURN src.dataset_name, src.column_name, src.expression,
                src.transform_type, src.confidence,
-               src.semantic_description, length(path) AS hops
+               src.semantic_description, length(path) AS hops,
+               src.source, src.review_state
         ORDER BY hops ASC
         """,
         {"pk": pk},
@@ -473,6 +479,8 @@ def lineage_column(table: str, column: str):
             "transform_type": r[3] or "",
             "confidence": float(r[4]) if r[4] is not None else None,
             "semantic_description": r[5] or "",
+            "source": r[7] or "unresolved",
+            "review_state": r[8] or "pending_review",
         })
 
     return {**head_payload, "upstream_chain": chain}
@@ -634,6 +642,144 @@ def lineage_process(stage: str, run_id: str):
         "output_table": output_table,
         "output_columns": out_cols,
     }
+
+
+# ----------------------------------------------------------------------
+# Catalog endpoints
+# ----------------------------------------------------------------------
+
+
+def _catalog():
+    """Return the LocalCatalog or None when TRACEX_CATALOG=off."""
+    from lineage.catalog.local import get_catalog  # noqa: WPS433
+    return get_catalog()
+
+
+def _hit_rate_from_latest_run() -> float:
+    """Walk the most recent JSONL run and return catalog hit rate (0..1)."""
+    files = _list_run_files()
+    if not files:
+        return 0.0
+    hits = misses = 0
+    try:
+        for line in files[0].read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if evt.get("event") == "lineage_manifest_complete":
+                hits += int(evt.get("catalog_hits") or 0)
+                misses += int(evt.get("catalog_misses") or 0)
+    except OSError:
+        return 0.0
+    total = hits + misses
+    return round(hits / total, 4) if total else 0.0
+
+
+@app.get("/api/catalog/health")
+def catalog_health():
+    cat = _catalog()
+    if cat is None:
+        return {"ok": True, "lineage_count": 0, "certification_count": 0,
+                "enabled": False}
+    h = cat.health()
+    return {**h, "enabled": True}
+
+
+@app.get("/api/catalog/status")
+def catalog_status():
+    cat = _catalog()
+    if cat is None:
+        return {
+            "enabled": False,
+            "certifications_count": 0,
+            "pending_count": 0,
+            "ratified_count": 0,
+            "hit_rate": 0.0,
+            "recent_activity": [],
+        }
+    pending = cat.list_pending_reviews()
+    certs = cat.list_certifications()
+    activity = cat.list_activity(limit=20)
+    h = cat.health()
+    # Ratified count = total - pending (per row, not per target).
+    pending_targets = {(p.target_table, p.target_column) for p in pending}
+    return {
+        "enabled": True,
+        "certifications_count": len(certs),
+        "pending_count": len(pending_targets),
+        "ratified_count": max(0, h.get("lineage_count", 0) - len(pending)),
+        "hit_rate": _hit_rate_from_latest_run(),
+        "recent_activity": activity,
+    }
+
+
+@app.get("/api/catalog/certifications")
+def catalog_certifications():
+    cat = _catalog()
+    return {"items": cat.list_certifications() if cat else []}
+
+
+@app.get("/api/catalog/pending")
+def catalog_pending():
+    cat = _catalog()
+    if cat is None:
+        return {"items": []}
+    raw = cat.list_pending_reviews()
+    # Group by target so the UI gets one row per (table, column) with all sources.
+    grouped: dict[tuple[str, str], dict] = {}
+    for e in raw:
+        key = (e.target_table, e.target_column)
+        bucket = grouped.setdefault(key, {
+            "target_table": e.target_table,
+            "target_column": e.target_column,
+            "source": e.source,
+            "confidence": e.confidence,
+            "awaiting_since": e.computed_at,
+            "sql_hash": e.sql_hash,
+            "sources": [],
+        })
+        if e.source_table or e.source_column:
+            bucket["sources"].append({
+                "source_table": e.source_table,
+                "source_column": e.source_column,
+                "transform_type": e.transform_type,
+            })
+    return {"items": sorted(grouped.values(),
+                            key=lambda r: (r["target_table"], r["target_column"]))}
+
+
+@app.get("/api/catalog/activity")
+def catalog_activity(limit: int = 20):
+    cat = _catalog()
+    return {"items": cat.list_activity(limit=int(limit)) if cat else []}
+
+
+class CatalogActionRequest(BaseModel):
+    table: str
+    column: str
+    reason: Optional[str] = ""
+
+
+@app.post("/api/catalog/ratify")
+def catalog_ratify(req: CatalogActionRequest):
+    cat = _catalog()
+    if cat is None:
+        return {"ok": False, "error": "catalog disabled (TRACEX_CATALOG=off)"}
+    cat.ratify(req.table, req.column, actor="ui_user", reason=req.reason or "")
+    return {"ok": True, "new_state": cat.get_review_state(req.table, req.column)}
+
+
+@app.post("/api/catalog/reject")
+def catalog_reject(req: CatalogActionRequest):
+    cat = _catalog()
+    if cat is None:
+        return {"ok": False, "error": "catalog disabled (TRACEX_CATALOG=off)"}
+    cat.reject(req.table, req.column, actor="ui_user", reason=req.reason or "")
+    return {"ok": True, "new_state": cat.get_review_state(req.table, req.column)}
 
 
 # ----------------------------------------------------------------------

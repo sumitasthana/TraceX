@@ -377,10 +377,21 @@ const App = (() => {
         }[tt]) || '#64748b';
       }
 
+      function sourceBorder(source) {
+        const palette = {
+          catalog:        '#1a7f4b',
+          sqlglot:        '#1d4ed8',
+          agent_inferred: '#b45309',
+          unresolved:     '#9ca3af',
+        };
+        return palette[String(source || 'unresolved').toLowerCase()] || '#9ca3af';
+      }
+
       function addColumnNode(table, col, parentDsId) {
         const id = colId(table, col.column);
         if (visNodes.get(id)) return id;
         const c = transformPalette(col.transform_type);
+        const border = sourceBorder(col.source);
         let baseX = 0, baseY = 0;
         const parentPos = network.getPositions([parentDsId])[parentDsId];
         if (parentPos) { baseX = parentPos.x; baseY = parentPos.y; }
@@ -388,12 +399,16 @@ const App = (() => {
           id,
           label: col.column,
           shape: 'box',
-          color: { background: c, border: c, highlight: { background: c, border: '#0c1f3d' } },
+          color: { background: c, border: border, highlight: { background: c, border: '#0c1f3d' } },
+          borderWidth: 3,           // visible source-provenance ring
+          borderWidthSelected: 4,
           font: { color: '#fff', face: 'DM Mono', size: 10 },
           margin: 5,
           widthConstraint: { maximum: 140 },
           nodeKind: 'Column',
           baseColor: c,
+          source: col.source || 'unresolved',
+          review_state: col.review_state || 'pending_review',
           // small jitter so they fan out instead of stacking on the parent
           x: baseX + (Math.random() - 0.5) * 60,
           y: baseY + 80 + (Math.random() - 0.5) * 80,
@@ -671,8 +686,10 @@ const App = (() => {
         <li class="col-row border-b border-g-100 last:border-b-0" data-table="${esc(table)}" data-column="${esc(c.column)}" data-idx="${i}">
           <button type="button" class="col-row-head w-full text-left px-2.5 py-1.5 hover:bg-g-50 flex items-center justify-between gap-2">
             <span class="font-mono text-[11px] text-g-800 truncate">${esc(c.column)}</span>
-            <span class="flex items-center gap-1.5 shrink-0">
+            <span class="flex items-center gap-1.5 shrink-0 flex-wrap">
               ${transformBadge(c.transform_type)}
+              ${sourceBadge(c.source)}
+              ${reviewStateBadge(c.review_state)}
               ${confidenceBadge(c.confidence)}
               <span class="text-[10px] text-g-400">${esc(c.data_type || '')}</span>
             </span>
@@ -725,6 +742,10 @@ const App = (() => {
     return `
       <div class="space-y-2">
         ${sd ? `<div class="text-[12px] text-g-800 leading-snug">${esc(sd)}</div>` : `<div class="text-[11px] text-g-400 italic">No semantic description (run with TRACEX_LINEAGE_AGENTS=on to enrich)</div>`}
+        <div class="flex items-center gap-1.5 flex-wrap">
+          ${sourceBadge(d.source)}
+          ${reviewStateBadge(d.review_state)}
+        </div>
         <div class="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px]">
           <div><span class="text-g-400 uppercase tracking-wider">Type</span> <span class="mono text-g-700">${esc(d.transform_type || '—')}</span></div>
           <div><span class="text-g-400 uppercase tracking-wider">Confidence</span> <span class="mono text-g-700">${d.confidence == null ? '—' : Number(d.confidence).toFixed(2)}</span></div>
@@ -743,6 +764,29 @@ const App = (() => {
             ${more}
           </div>` : '<div class="text-[11px] text-g-400 italic">No upstream — source-table column.</div>'}
       </div>`;
+  }
+
+  function sourceBadge(source) {
+    const palette = {
+      catalog:        { bg: '#1a7f4b', label: 'CATALOG' },
+      sqlglot:        { bg: '#1d4ed8', label: 'SQLGLOT' },
+      agent_inferred: { bg: '#b45309', label: 'AGENT' },
+      unresolved:     { bg: '#6b7280', label: 'UNRESOLVED' },
+    };
+    const key = String(source || 'unresolved').toLowerCase();
+    const meta = palette[key] || palette.unresolved;
+    return `<span style="display:inline-block;font-family:'DM Mono',monospace;font-size:9.5px;letter-spacing:.04em;background:${meta.bg};color:#fff;padding:1px 5px;border-radius:3px;">${meta.label}</span>`;
+  }
+
+  function reviewStateBadge(state) {
+    const s = String(state || '').toLowerCase();
+    if (s === 'ratified') {
+      return `<span style="display:inline-block;font-family:'DM Mono',monospace;font-size:9.5px;background:#e6f5ee;color:#1a7f4b;padding:1px 6px;border-radius:9999px;">✓ ratified</span>`;
+    }
+    if (s === 'pending_review') {
+      return `<span style="display:inline-block;font-family:'DM Mono',monospace;font-size:9.5px;background:#fef3cd;color:#b45309;padding:1px 6px;border-radius:9999px;">⏱ pending</span>`;
+    }
+    return '';
   }
 
   function transformBadge(t) {
@@ -870,6 +914,167 @@ const App = (() => {
     } catch (e) { setError(e); }
   }
 
+  // ---------- Catalog view ---------------------------------------------
+
+  function profileBadge(p) {
+    const palette = {
+      P1: { bg: '#fde8e8', fg: '#b91c1c' },
+      P2: { bg: '#fef3cd', fg: '#b45309' },
+      P3: { bg: '#eff4ff', fg: '#1d4ed8' },
+    };
+    const m = palette[p] || palette.P3;
+    return `<span style="display:inline-block;font-family:'DM Mono',monospace;font-size:10px;font-weight:600;padding:2px 8px;border-radius:9999px;background:${m.bg};color:${m.fg};">${esc(p || '?')}</span>`;
+  }
+
+  async function viewCatalog() {
+    setLoading();
+    try {
+      const [status, certs, pending, activity, health] = await Promise.all([
+        api('/api/catalog/status'),
+        api('/api/catalog/certifications'),
+        api('/api/catalog/pending'),
+        api('/api/catalog/activity?limit=20'),
+        api('/api/catalog/health'),
+      ]);
+
+      const disabled = !health.enabled;
+      const banner = disabled
+        ? `<div class="card p-3 mb-4 animate-fadein" style="background:#fef3cd;border-color:#b45309;color:#b45309;font-size:12px"><strong>Catalog disabled</strong> — set <code class="mono">TRACEX_CATALOG=on</code> and re-run the pipeline to capture entries.</div>`
+        : '';
+
+      const metricCard = (label, value, sub, color = '#1f2937') => `
+        <div class="metric-card">
+          <div class="label">${esc(label)}</div>
+          <div class="value" style="color:${color}">${value}</div>
+          <div class="sub">${esc(sub)}</div>
+        </div>`;
+
+      const hitRatePct = ((status.hit_rate || 0) * 100).toFixed(1) + '%';
+      const metrics = `
+        <div class="grid grid-cols-2 md:grid-cols-3 gap-4 mb-6 animate-fadein">
+          ${metricCard('Catalog hit rate', hitRatePct, 'From most recent pipeline run',
+                       (status.hit_rate || 0) > 0 ? '#1a7f4b' : '#6b7280')}
+          ${metricCard('Pending reviews', fmtInt(status.pending_count || 0),
+                       'AI-inferred edges awaiting steward review',
+                       (status.pending_count || 0) > 0 ? '#b45309' : '#6b7280')}
+          ${metricCard('Ratified entries', fmtInt(status.ratified_count || 0),
+                       `${fmtInt(status.certifications_count || 0)} certifications`,
+                       '#1a7f4b')}
+        </div>`;
+
+      const certsTbody = (certs.items || []).map(c => `
+        <tr class="cert-row cursor-pointer" data-name="${esc(c.table_name)}">
+          <td class="mono">${esc(c.table_name)}</td>
+          <td>${profileBadge(c.profile)}</td>
+          <td class="mono text-g-500">${esc(c.certified_by || '—')}</td>
+          <td class="mono text-g-500">${esc((c.certified_at || '').slice(0, 19).replace('T', ' '))}</td>
+          <td class="text-g-600">${esc(c.notes || '')}</td>
+        </tr>`).join('');
+      const certsHtml = `
+        <div class="card animate-fadein mb-6">
+          <div class="px-4 py-3 border-b border-g-100 flex items-center justify-between">
+            <h2 class="text-[14px] font-semibold text-g-800">Certifications</h2>
+            <span class="text-[11px] text-g-500">${(certs.items || []).length} table(s)</span>
+          </div>
+          <table class="tbl">
+            <thead><tr><th>Table</th><th>Profile</th><th>Certified by</th><th>Certified at</th><th>Notes</th></tr></thead>
+            <tbody>${certsTbody || '<tr><td colspan="5" class="text-g-400">No certifications. Run <code class="mono">python cli.py catalog seed</code>.</td></tr>'}</tbody>
+          </table>
+        </div>`;
+
+      const pendingItems = pending.items || [];
+      const pendingTbody = pendingItems.map(p => {
+        const srcText = (p.sources || []).map(s =>
+          `<span class="chip-mono">${esc(s.source_table)}.${esc(s.source_column)}</span>`
+        ).join(' ') || '<span class="text-g-400 text-[10px]">unresolved</span>';
+        return `
+          <tr>
+            <td class="mono">${esc(p.target_table)}.${esc(p.target_column)}</td>
+            <td>${srcText}</td>
+            <td class="text-right mono">${p.confidence == null ? '—' : Number(p.confidence).toFixed(2)}</td>
+            <td class="mono text-g-500">${esc((p.awaiting_since || '').slice(0,19).replace('T', ' '))}</td>
+            <td class="text-right">
+              <button type="button" class="btn-secondary cat-action" data-action="ratify" data-table="${esc(p.target_table)}" data-column="${esc(p.target_column)}" style="background:#e6f5ee;color:#1a7f4b;border-color:#1a7f4b;margin-right:4px">Ratify</button>
+              <button type="button" class="btn-secondary cat-action" data-action="reject" data-table="${esc(p.target_table)}" data-column="${esc(p.target_column)}" style="background:#fde8e8;color:#b91c1c;border-color:#b91c1c">Reject</button>
+            </td>
+          </tr>`;
+      }).join('');
+      const pendingHtml = `
+        <div class="card animate-fadein mb-6">
+          <div class="px-4 py-3 border-b border-g-100 flex items-center justify-between">
+            <h2 class="text-[14px] font-semibold text-g-800">Pending review queue</h2>
+            <span class="text-[11px] text-g-500">${pendingItems.length} edge(s) awaiting review</span>
+          </div>
+          ${pendingItems.length === 0
+            ? '<div class="px-4 py-6 text-[12px] text-g-500">No pending reviews. All AI-inferred lineage has been ratified or rejected.</div>'
+            : `<table class="tbl">
+                 <thead><tr><th>Target</th><th>Source(s)</th><th class="text-right">Confidence</th><th>Awaiting since</th><th class="text-right">Actions</th></tr></thead>
+                 <tbody>${pendingTbody}</tbody>
+               </table>`}
+        </div>`;
+
+      const actTbody = (activity.items || []).map(a => `
+        <tr>
+          <td class="mono text-g-500">${esc((a.ts || '').slice(0,19).replace('T',' '))}</td>
+          <td class="mono">${esc(a.actor || '—')}</td>
+          <td><span class="chip-mono">${esc(a.action || '')}</span></td>
+          <td class="mono">${esc(a.table_name || '')}${a.column_name ? '.' + esc(a.column_name) : ''}</td>
+          <td class="text-g-600">${esc(a.reason || '')}</td>
+        </tr>`).join('');
+      const activityHtml = `
+        <div class="card animate-fadein mb-6">
+          <div class="px-4 py-3 border-b border-g-100 flex items-center justify-between">
+            <h2 class="text-[14px] font-semibold text-g-800">Recent activity</h2>
+            <span class="text-[11px] text-g-500">last 20</span>
+          </div>
+          <table class="tbl">
+            <thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Target</th><th>Reason</th></tr></thead>
+            <tbody>${actTbody || '<tr><td colspan="5" class="text-g-400">No activity yet.</td></tr>'}</tbody>
+          </table>
+        </div>`;
+
+      root.innerHTML =
+        pageHeader('Catalog',
+                   'Certifications, pending-review queue, and activity log for the local catalog layer')
+        + banner + metrics + certsHtml + pendingHtml + activityHtml;
+
+      // Wire ratify / reject buttons
+      root.querySelectorAll('.cat-action').forEach(btn => {
+        btn.addEventListener('click', async (ev) => {
+          const action = btn.dataset.action;
+          const t = btn.dataset.table;
+          const c = btn.dataset.column;
+          const reason = window.prompt(
+            `Reason for ${action}ing ${t}.${c}? (optional)`, ''
+          );
+          if (reason === null) return;  // cancelled
+          btn.disabled = true;
+          try {
+            const res = await fetch(`/api/catalog/${action}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ table: t, column: c, reason }),
+            });
+            const data = await res.json();
+            if (!data.ok) throw new Error(data.error || 'request failed');
+          } catch (e) {
+            alert(`Failed: ${e.message}`);
+          } finally {
+            viewCatalog();  // refresh
+          }
+        });
+      });
+
+      // Click a cert row → open Datasets and let the user dive in
+      root.querySelectorAll('.cert-row').forEach(tr => {
+        tr.addEventListener('click', () => {
+          location.hash = '#/datasets';
+        });
+      });
+
+    } catch (e) { setError(e); }
+  }
+
   // ---------- router ---------------------------------------------------
 
   const routes = [
@@ -878,6 +1083,7 @@ const App = (() => {
     { match: /^#\/runs\/(.+)$/,                     view: (m) => viewRunDetail(decodeURIComponent(m[1])), nav: 'runs' },
     { match: /^#\/lineage$/,                        view: () => viewLineage(),                       nav: 'lineage' },
     { match: /^#\/datasets$/,                       view: () => viewDatasets(),                      nav: 'datasets' },
+    { match: /^#\/catalog$/,                        view: () => viewCatalog(),                       nav: 'catalog' },
     { match: /^#\/dq$/,                             view: () => viewDQ(),                            nav: 'dq' },
     { match: /^#\/discover$/,                       view: () => Discover.render(),                   nav: 'discover' },
   ];

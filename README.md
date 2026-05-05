@@ -34,7 +34,12 @@ TraceX/
 │   ├── parser.py
 │   ├── graph_builder.py
 │   ├── ingest.py              CLI: --run-id / --log-file / --latest
-│   └── queries.py
+│   ├── queries.py
+│   ├── manifest_builder.py    live post-stage hook (Phase A → G)
+│   ├── sql_parser.py          deterministic sqlglot walker
+│   ├── agents/                sql_parser, enrichment, impact_analyst, chat
+│   └── catalog/               local catalog (DuckDB), client protocol,
+│                              merge logic, seeder, tests
 │
 ├── graph/                     JanusGraph integration
 │   └── healthcheck.py         wait → bootstrap schema → smoke test
@@ -45,7 +50,8 @@ TraceX/
 │   └── static/                hash-routed Themis-styled SPA
 │
 ├── docs/
-│   └── PIPELINE.md            stage-by-stage reference, DQ rules, event taxonomy
+│   ├── PIPELINE.md            stage-by-stage reference, DQ rules, event taxonomy
+│   └── CATALOG.md             catalog-first lineage: provenance, ratify/reject, gating
 │
 └── logs/                      one {run_id}.jsonl per pipeline run (gitignored)
 ```
@@ -95,7 +101,9 @@ python graph\healthcheck.py            # wait for Gremlin, bootstrap schema, smo
 ```
 
 See [docs/PIPELINE.md](docs/PIPELINE.md) for the stage-by-stage walkthrough,
-DQ rules, and event taxonomy.
+DQ rules, and event taxonomy. See [docs/CATALOG.md](docs/CATALOG.md) for
+the catalog-first lineage layer (provenance, ratify/reject lifecycle,
+profile gating, divergence rule).
 
 ## Environment variables
 
@@ -107,5 +115,6 @@ DQ rules, and event taxonomy.
 | `TRACEX_RUN_ID`      | (fresh UUID per process)             | Set by orchestrator so all stages share one |
 | `TRACEX_UI_HOST`     | `127.0.0.1`                          | UI bind host                                |
 | `TRACEX_UI_PORT`     | `8765`                               | UI port                                     |
+| `TRACEX_CATALOG`     | `on`                                 | Set to `off` to bypass the catalog phase entirely (legacy pre-catalog behaviour: everything tagged `ratified`) |
 
 A `.env` file at the repo root is auto-loaded.

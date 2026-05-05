@@ -50,12 +50,21 @@ def get_direct_downstream(table: str, column: str) -> str:
 
 
 @tool
-def get_full_downstream_chain(table: str, column: str, max_hops: int = 10) -> str:
+def get_full_downstream_chain(
+    table: str,
+    column: str,
+    max_hops: int = 10,
+    include_unratified: bool = False,
+) -> str:
     """Recursive DERIVES_FROM walk, returning every descendant column.
 
-    Each line: `<dataset>.<column>  [transform_type]  hops=<n>`. Stops a
-    branch when no further DERIVES_FROM edge points at the current node.
-    Caps at `max_hops` (default 10) to bound traversal cost.
+    By default applies **profile gating**: pending-review edges whose target
+    column lives in a P1-certified table (read from the catalog; falls back
+    to the `fct_*` prefix when the catalog is off) are excluded. The agent
+    can ask for everything by passing `include_unratified=True` — the
+    supervisor surfaces this when the user explicitly says so.
+
+    Each line: `<dataset>.<column>  [transform_type]  source=<S> review=<R> hops=<n>`.
     """
     pk = _column_pk(column, table)
     upper = max(1, min(int(max_hops), 25))
@@ -65,7 +74,8 @@ def get_full_downstream_chain(table: str, column: str, max_hops: int = 10) -> st
             f"""
             MATCH path = (child:{COL})-[:DERIVES_FROM*1..{upper}]->(c:{COL} {{pk: $pk}})
             RETURN child.dataset_name, child.column_name,
-                   child.transform_type, length(path) AS hops
+                   child.transform_type, child.review_state, child.source,
+                   length(path) AS hops
             ORDER BY hops ASC
             """,
             {"pk": pk},
@@ -73,18 +83,68 @@ def get_full_downstream_chain(table: str, column: str, max_hops: int = 10) -> st
     except Exception as exc:
         return f"Error: {exc}"
 
+    p1_tables = _p1_table_set()
+
     seen: set[tuple[str, str]] = set()
     rows: list[str] = []
+    filtered = 0
     while result.has_next():
         r = result.get_next()
-        key = (str(r[0]), str(r[1]))
+        ds, col_name = str(r[0]), str(r[1])
+        key = (ds, col_name)
         if key in seen:
             continue
         seen.add(key)
-        rows.append(f"  {r[0]}.{r[1]}  [{r[2] or '?'}]  hops={int(r[3])}")
-    if not rows:
-        return f"(no downstream chain for {table}.{column})"
-    return f"Downstream chain of {table}.{column} (max_hops={upper}):\n" + "\n".join(rows)
+
+        review_state = str(r[3] or "")
+        source = str(r[4] or "")
+        is_p1 = (ds in p1_tables) if p1_tables else ds.startswith("fct_")
+
+        if (
+            not include_unratified
+            and review_state == "pending_review"
+            and is_p1
+        ):
+            filtered += 1
+            continue
+
+        rows.append(
+            f"  {ds}.{col_name}  [{r[2] or '?'}]  "
+            f"source={source or '?'} review={review_state or '?'} hops={int(r[5])}"
+        )
+
+    head = f"Downstream chain of {table}.{column} (max_hops={upper}):"
+    body = "\n".join(rows) if rows else "  (none)"
+    note = ""
+    if filtered:
+        note = (
+            f"\nNote: {filtered} pending-review edge(s) excluded from impact "
+            f"(P1 gating). Pass include_unratified=True to see them."
+        )
+        try:
+            import structlog
+            structlog.get_logger().bind(component="impact_analyst").info(
+                "impact_filtered_unratified",
+                table=table, column=column, filtered=filtered,
+            )
+        except Exception:
+            pass
+    return f"{head}\n{body}{note}"
+
+
+def _p1_table_set() -> set[str]:
+    """Return the set of P1-certified tables. Empty when catalog is disabled."""
+    try:
+        from lineage.catalog.local import get_catalog
+        cat = get_catalog()
+        if cat is None:
+            return set()
+        return {
+            row["table_name"] for row in cat.list_certifications()
+            if row.get("profile", "").upper() == "P1"
+        }
+    except Exception:
+        return set()
 
 
 @tool

@@ -43,6 +43,7 @@ python layer0\load_duckdb.py  # writes data/tracex_layer0.duckdb
 | Variable          | Default                                                         | Meaning                                                              |
 |-------------------|-----------------------------------------------------------------|----------------------------------------------------------------------|
 | `TRACEX_DB_PATH`  | `data\tracex_layer0.duckdb`                                     | DuckDB file the pipeline reads/writes.                               |
+| `TRACEX_CATALOG`  | `on`                                                            | Set to `off` to bypass the catalog phase (legacy pre-catalog behaviour). See [CATALOG.md](CATALOG.md). |
 | `TRACEX_LOG_DIR`  | `.\logs`                                                        | Where `{run_id}.jsonl` files are written.                            |
 | `TRACEX_RUN_ID`   | (unset → fresh UUID per process)                                | Set by the orchestrator so all stages in a run share a run_id.       |
 
