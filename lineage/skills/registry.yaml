@@ -1,0 +1,15 @@
+skills:
+  - name: sql_parsing
+    path: sql_parsing/SKILL.md
+    trigger_patterns: ["ambiguous column", "cte resolution", "duckdb sql"]
+    priority: 10
+
+  - name: column_lineage
+    path: column_lineage/SKILL.md
+    trigger_patterns: ["column node", "derives_from", "semantic description"]
+    priority: 10
+
+  - name: impact_analysis
+    path: impact_analysis/SKILL.md
+    trigger_patterns: ["impact", "breaking change", "rename", "downstream"]
+    priority: 10

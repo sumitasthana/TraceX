@@ -147,11 +147,34 @@ def main() -> int:
             t0 = time.perf_counter()
             con.execute(TRANSFORM_SQL)
             output_rows = table_row_count(con, OUTPUT_TABLE)
+            transform_ms = int((time.perf_counter() - t0) * 1000)
             log.info(
                 "transform_complete",
                 output_row_count=output_rows,
-                duration_ms=int((time.perf_counter() - t0) * 1000),
+                duration_ms=transform_ms,
             )
+
+            try:
+                from lineage.manifest_builder import build_and_ingest  # noqa: E402
+                build_and_ingest(
+                    stage=STAGE_NAME,
+                    run_id=run_id,
+                    sql=TRANSFORM_SQL,
+                    target_table=OUTPUT_TABLE,
+                    source_tables=["src_transaction", "stg_fx_resolved"],
+                    depends_on_stages=["01_stg_fx_normalize"],
+                    transform_type="TRANSFORM_JOIN",
+                    output_row_count=output_rows,
+                    duration_ms=transform_ms,
+                    con=con,
+                )
+            except Exception as exc:
+                log.warning(
+                    "lineage_manifest_invoke_failed",
+                    stage=STAGE_NAME,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
 
             # FX misses — non-USD transactions that fell back to the earliest known rate
             miss_rows = con.execute(FX_MISS_SQL).fetchall()

@@ -32,7 +32,14 @@ from typing import Optional
 import kuzu
 
 from lineage.config import configure_logging, get_db, get_conn, get_graph_path
-from lineage.models import LineageManifest, ParsedRun, StageMetrics
+from lineage.models import (
+    ColumnLineageMap,
+    LineageManifest,
+    ParsedRun,
+    StageMetrics,
+    StageLineageManifest,
+    TransformType,
+)
 
 COLUMN_REF_PATTERN = re.compile(r"([A-Za-z_]\w*)\.([A-Za-z_]\w*)")
 
@@ -95,6 +102,20 @@ REL_TABLES = [
     f"CREATE REL TABLE CLASSIFIED_AS(FROM {COL} TO Tag)",
 ]
 
+# Deep-lineage column properties layered on top of the base Column table.
+# Each entry is a (table, column, type) tuple. We try ALTER TABLE ADD for each;
+# Kuzu raises a "already exists" RuntimeError if the column has been added before,
+# which we treat as a no-op for idempotency.
+EXTRA_COLUMN_PROPS = [
+    (COL, "expression",           "STRING"),
+    (COL, "semantic_description", "STRING"),
+    (COL, "confidence",           "DOUBLE"),
+    (COL, "transform_type",       "STRING"),
+    (COL, "data_type",            "STRING"),
+    (COL, "sql_hash",             "STRING"),
+    ("Process", "sql_hash",       "STRING"),
+]
+
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -140,7 +161,28 @@ class GraphBuilder:
                     continue
                 self.log.error("schema_bootstrap_failed", label=label, error=str(exc))
                 raise
-        self.log.info("schema_bootstrap_complete", tables_created=created)
+
+        # Idempotent ALTERs for the deep-lineage column extensions.
+        added_props: list[str] = []
+        for table, col_name, col_type in EXTRA_COLUMN_PROPS:
+            try:
+                self.conn.execute(f"ALTER TABLE {table} ADD {col_name} {col_type}")
+                added_props.append(f"{table}.{col_name}")
+            except RuntimeError as exc:
+                if _is_already_exists(exc) or "duplicate" in str(exc).lower():
+                    continue
+                self.log.warning(
+                    "schema_alter_failed",
+                    table=table,
+                    column=col_name,
+                    error=str(exc),
+                )
+
+        self.log.info(
+            "schema_bootstrap_complete",
+            tables_created=created,
+            properties_added=added_props,
+        )
 
     @staticmethod
     def _extract_label(stmt: str) -> str:
@@ -266,28 +308,84 @@ class GraphBuilder:
         )
 
     def _upsert_column(
-        self, column_name: str, dataset_name: str, derivation: str, computed_at: str
+        self,
+        column_name: str,
+        dataset_name: str,
+        derivation: str,
+        computed_at: str,
+        expression: str = "",
+        transform_type: str = "",
+        confidence: Optional[float] = None,
+        data_type: str = "",
+        sql_hash: str = "",
+        semantic_description: Optional[str] = None,
     ) -> None:
+        """Upsert a Column node.
+
+        Always sets the natural-key fields on CREATE. On MATCH, every property
+        EXCEPT `semantic_description` is overwritten — that one is owned by
+        the enrichment agent and would otherwise be wiped by every re-ingest.
+        Pass `semantic_description=""` (empty string, not None) to explicitly
+        clear it.
+        """
         ts = computed_at or _utc_now_iso()
         pk = _column_pk(column_name, dataset_name)
+        params = {
+            "pk": pk,
+            "column_name": column_name,
+            "dataset_name": dataset_name,
+            "derivation": derivation or "",
+            "computed_at": ts,
+            "expression": expression or "",
+            "transform_type": transform_type or "",
+            "confidence": float(confidence) if confidence is not None else 0.0,
+            "data_type": data_type or "",
+            "sql_hash": sql_hash or "",
+            # `MERGE ... ON MATCH SET` cannot conditionally branch in Kuzu.
+            # We pre-resolve: if caller passed None, look up the existing node
+            # and pass the current value back through so the SET is a no-op.
+            "semantic_description": (
+                semantic_description if semantic_description is not None
+                else self._existing_semantic_description(pk)
+            ),
+        }
         self.conn.execute(
             f"""
             MERGE (c:{COL} {{pk: $pk}})
-            ON CREATE SET c.column_name  = $column_name,
-                          c.dataset_name = $dataset_name,
-                          c.derivation   = $derivation,
-                          c.computed_at  = $computed_at
-            ON MATCH  SET c.derivation   = $derivation
+            ON CREATE SET c.column_name          = $column_name,
+                          c.dataset_name         = $dataset_name,
+                          c.derivation           = $derivation,
+                          c.computed_at          = $computed_at,
+                          c.expression           = $expression,
+                          c.transform_type       = $transform_type,
+                          c.confidence           = $confidence,
+                          c.data_type            = $data_type,
+                          c.sql_hash             = $sql_hash,
+                          c.semantic_description = $semantic_description
+            ON MATCH  SET c.derivation           = $derivation,
+                          c.expression           = $expression,
+                          c.transform_type       = $transform_type,
+                          c.confidence           = $confidence,
+                          c.data_type            = $data_type,
+                          c.sql_hash             = $sql_hash,
+                          c.semantic_description = $semantic_description
             """,
-            {
-                "pk": pk,
-                "column_name": column_name,
-                "dataset_name": dataset_name,
-                "derivation": derivation or "",
-                "computed_at": ts,
-            },
+            params,
         )
         self.log.info("column_upserted", column_name=column_name, dataset_name=dataset_name)
+
+    def _existing_semantic_description(self, pk: str) -> str:
+        try:
+            r = self.conn.execute(
+                f"MATCH (c:{COL} {{pk: $pk}}) RETURN c.semantic_description",
+                {"pk": pk},
+            )
+            if r.has_next():
+                val = r.get_next()[0]
+                return str(val) if val is not None else ""
+        except RuntimeError:
+            pass
+        return ""
 
     # ------------------------------------------------------------------
     # Edge upserts
@@ -358,8 +456,8 @@ class GraphBuilder:
                 if src_table == manifest.target_table and src_col == col_name:
                     continue  # self-reference
 
-                self._upsert_column(src_col, src_table, "", manifest.ts)
-                self._upsert_column(col_name, manifest.target_table, derivation, manifest.ts)
+                self._upsert_column(src_col, src_table, "", manifest.ts, semantic_description=None)
+                self._upsert_column(col_name, manifest.target_table, derivation, manifest.ts, semantic_description=None)
 
                 created = self._safe_merge_rel(
                     COL, {"pk": _column_pk(col_name, manifest.target_table)},
@@ -426,11 +524,185 @@ class GraphBuilder:
 
         # 4. Columns (target side)
         for col_name, derivation in manifest.derived_columns.items():
-            self._upsert_column(col_name, manifest.target_table, derivation, manifest.ts)
+            self._upsert_column(
+                col_name, manifest.target_table, derivation, manifest.ts,
+                semantic_description=None,
+            )
 
         # 5. Column-level lineage (only fires when the derivation expression
         #    contains qualified table.column refs whose table is in source_tables).
         self._link_column_derivations(manifest)
+
+    # ------------------------------------------------------------------
+    # Deep-lineage path: StageLineageManifest ingestion
+    # ------------------------------------------------------------------
+
+    def _upsert_process_with_hash(
+        self,
+        stage: str,
+        run_id: str,
+        transform_type: str,
+        target_table: str,
+        duration_ms: int,
+        output_row_count: int,
+        sql_hash: str,
+        ts: str,
+    ) -> None:
+        pk = _process_pk(stage, run_id)
+        self.conn.execute(
+            """
+            MERGE (p:Process {pk: $pk})
+            ON CREATE SET p.stage            = $stage,
+                          p.run_id           = $run_id,
+                          p.transform_type   = $transform_type,
+                          p.target_table     = $target_table,
+                          p.duration_ms      = $duration_ms,
+                          p.output_row_count = $output_row_count,
+                          p.sql_hash         = $sql_hash,
+                          p.computed_at      = $computed_at
+            ON MATCH  SET p.transform_type   = $transform_type,
+                          p.target_table     = $target_table,
+                          p.duration_ms      = $duration_ms,
+                          p.output_row_count = $output_row_count,
+                          p.sql_hash         = $sql_hash
+            """,
+            {
+                "pk": pk,
+                "stage": stage,
+                "run_id": run_id,
+                "transform_type": transform_type,
+                "target_table": target_table,
+                "duration_ms": int(duration_ms),
+                "output_row_count": int(output_row_count),
+                "sql_hash": sql_hash or "",
+                "computed_at": ts or _utc_now_iso(),
+            },
+        )
+        self.log.info(
+            "process_upserted",
+            stage=stage,
+            run_id=run_id,
+            transform_type=transform_type,
+            sql_hash_prefix=(sql_hash or "")[:12],
+        )
+
+    def _upsert_column_from_map(self, column_map: ColumnLineageMap, ts: str) -> None:
+        """Write the target Column node + every source Column node + DERIVES_FROM edges.
+
+        Source column nodes are upserted as stubs (no expression / transform_type)
+        so the edge endpoints exist. Their richer properties get filled in when
+        the upstream stage that produces them runs through this same path.
+        """
+        target_col = column_map.target_column
+        target_table = column_map.target_table
+        transform_type = (
+            column_map.sources[0].transform_type.value
+            if column_map.sources
+            else (TransformType.AMBIGUOUS.value if column_map.ambiguous else TransformType.CONSTANT.value)
+        )
+
+        # Target column — fully populated. Preserve any existing semantic_description
+        # (passed as None) so the enrichment agent's writes survive re-ingest.
+        self._upsert_column(
+            column_name=target_col,
+            dataset_name=target_table,
+            derivation=column_map.full_expression,
+            computed_at=ts,
+            expression=column_map.full_expression,
+            transform_type=transform_type,
+            confidence=column_map.confidence,
+            data_type=column_map.data_type,
+            sql_hash=column_map.sql_hash,
+            semantic_description=None,
+        )
+
+        for edge in column_map.sources:
+            if edge.source_table == target_table and edge.source_column == target_col:
+                continue  # self-reference
+
+            # Source side — stub. Don't overwrite a richer node if one already exists.
+            self._upsert_column(
+                column_name=edge.source_column,
+                dataset_name=edge.source_table,
+                derivation="",
+                computed_at=ts,
+                expression="",
+                transform_type="",
+                confidence=None,
+                data_type="",
+                sql_hash="",
+                semantic_description=None,
+            )
+
+            created = self._safe_merge_rel(
+                COL, {"pk": _column_pk(target_col, target_table)},
+                "DERIVES_FROM",
+                COL, {"pk": _column_pk(edge.source_column, edge.source_table)},
+            )
+            if created:
+                self.log.info(
+                    "column_lineage_edge",
+                    target_col=target_col,
+                    target_dataset=target_table,
+                    source_col=edge.source_column,
+                    source_dataset=edge.source_table,
+                    transform_type=edge.transform_type.value if hasattr(edge.transform_type, "value") else str(edge.transform_type),
+                )
+
+    def ingest_stage_manifest(self, manifest: StageLineageManifest) -> dict:
+        """Ingest a deep-lineage manifest produced live by manifest_builder.
+
+        Same idempotency contract as `ingest_run`: re-running with the same
+        manifest leaves the graph identical. Returns a small summary dict.
+        """
+        started = time.perf_counter()
+        ts = manifest.ts or _utc_now_iso()
+
+        # 1. Datasets
+        self._upsert_dataset(manifest.target_table, manifest.output_row_count, ts)
+        for src in manifest.source_tables:
+            self._upsert_dataset(src, 0, ts)
+
+        # 2. Process (with sql_hash)
+        self._upsert_process_with_hash(
+            stage=manifest.stage,
+            run_id=manifest.run_id,
+            transform_type=manifest.transform_type,
+            target_table=manifest.target_table,
+            duration_ms=manifest.duration_ms,
+            output_row_count=manifest.output_row_count,
+            sql_hash=manifest.sql_hash,
+            ts=ts,
+        )
+
+        # 3. Edges around the Process
+        for src in manifest.source_tables:
+            self._link_input_to(src, manifest.stage, manifest.run_id)
+        self._link_produces(manifest.stage, manifest.run_id, manifest.target_table)
+        for dep in manifest.depends_on_stages:
+            self._link_depends_on(manifest.stage, manifest.run_id, dep)
+
+        # 4. Column nodes + DERIVES_FROM edges
+        columns_written = 0
+        for cm in manifest.column_maps:
+            try:
+                self._upsert_column_from_map(cm, ts)
+                columns_written += 1
+            except Exception:
+                self.log.exception(
+                    "column_map_ingest_failed",
+                    target_table=cm.target_table,
+                    target_column=cm.target_column,
+                )
+
+        return {
+            "stage": manifest.stage,
+            "run_id": manifest.run_id,
+            "target_table": manifest.target_table,
+            "columns_written": columns_written,
+            "columns_total": len(manifest.column_maps),
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+        }
 
     def close(self) -> None:
         try:

@@ -94,11 +94,34 @@ def main() -> int:
             t0 = time.perf_counter()
             con.execute(TRANSFORM_SQL)
             output_rows = table_row_count(con, OUTPUT_TABLE)
+            transform_ms = int((time.perf_counter() - t0) * 1000)
             log.info(
                 "transform_complete",
                 output_row_count=output_rows,
-                duration_ms=int((time.perf_counter() - t0) * 1000),
+                duration_ms=transform_ms,
             )
+
+            try:
+                from lineage.manifest_builder import build_and_ingest  # noqa: E402
+                build_and_ingest(
+                    stage=STAGE_NAME,
+                    run_id=run_id,
+                    sql=TRANSFORM_SQL,
+                    target_table=OUTPUT_TABLE,
+                    source_tables=["src_customer", "src_branch"],
+                    depends_on_stages=[],
+                    transform_type="TRANSFORM_JOIN",
+                    output_row_count=output_rows,
+                    duration_ms=transform_ms,
+                    con=con,
+                )
+            except Exception as exc:
+                log.warning(
+                    "lineage_manifest_invoke_failed",
+                    stage=STAGE_NAME,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
 
             # KYC freshness summary
             stale_count, total_count = con.execute(KYC_STATS_SQL).fetchone()

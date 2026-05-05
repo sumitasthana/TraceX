@@ -369,6 +369,237 @@ def list_datasets():
 # Static file serving — index.html at /, assets at /static/*.
 # ----------------------------------------------------------------------
 
+# ----------------------------------------------------------------------
+# Deep column-lineage endpoints
+# ----------------------------------------------------------------------
+
+COL_LABEL = "`Column`"
+
+
+def _column_pk(column_name: str, dataset_name: str) -> str:
+    return f"{dataset_name}::{column_name}"
+
+
+@app.get("/api/lineage/column/{table}/{column}")
+def lineage_column(table: str, column: str):
+    """Full upstream chain for a single column across all hops."""
+    c = kuzu_conn()
+    pk = _column_pk(column, table)
+    head = c.execute(
+        f"""
+        MATCH (n:{COL_LABEL} {{pk: $pk}})
+        RETURN n.column_name, n.dataset_name, n.expression,
+               n.transform_type, n.confidence, n.data_type,
+               n.semantic_description, n.sql_hash
+        """,
+        {"pk": pk},
+    )
+    if not head.has_next():
+        raise HTTPException(404, f"column not found: {table}.{column}")
+    row = head.get_next()
+    head_payload = {
+        "table": row[1],
+        "column": row[0],
+        "expression": row[2] or "",
+        "transform_type": row[3] or "",
+        "confidence": float(row[4]) if row[4] is not None else None,
+        "data_type": row[5] or "",
+        "semantic_description": row[6] or "",
+        "sql_hash": row[7] or "",
+    }
+
+    chain_q = c.execute(
+        f"""
+        MATCH path = (start:{COL_LABEL} {{pk: $pk}})
+                     -[:DERIVES_FROM*1..10]->(src:{COL_LABEL})
+        RETURN src.dataset_name, src.column_name, src.expression,
+               src.transform_type, src.confidence,
+               src.semantic_description, length(path) AS hops
+        ORDER BY hops ASC
+        """,
+        {"pk": pk},
+    )
+    seen: set[tuple[str, str, int]] = set()
+    chain: list[dict] = []
+    while chain_q.has_next():
+        r = chain_q.get_next()
+        key = (str(r[0]), str(r[1]), int(r[6]))
+        if key in seen:
+            continue
+        seen.add(key)
+        chain.append({
+            "hop": int(r[6]),
+            "source_table": r[0],
+            "source_column": r[1],
+            "expression": r[2] or "",
+            "transform_type": r[3] or "",
+            "confidence": float(r[4]) if r[4] is not None else None,
+            "semantic_description": r[5] or "",
+        })
+
+    return {**head_payload, "upstream_chain": chain}
+
+
+@app.get("/api/lineage/impact/{table}/{column}")
+def lineage_impact(table: str, column: str, change_type: str = "RENAME"):
+    """Invoke the impact_analyst agent. Falls back to a direct Kuzu query on agent failure.
+
+    `change_type` accepts RENAME, TYPE_CHANGE, or DROP. Defaults to RENAME.
+    Returns the agent's JSON impact report verbatim, or
+    `{error, fallback}` when the agent is disabled / fails.
+    """
+    change_type = (change_type or "RENAME").upper()
+    if change_type not in {"RENAME", "TYPE_CHANGE", "DROP"}:
+        raise HTTPException(400, f"unsupported change_type: {change_type}")
+
+    # Direct downstream chain — used both as the agent's input context AND
+    # as the fallback payload when the agent isn't available.
+    c = kuzu_conn()
+    pk = _column_pk(column, table)
+    fallback_q = c.execute(
+        f"""
+        MATCH path = (child:{COL_LABEL})-[:DERIVES_FROM*1..10]->(c:{COL_LABEL} {{pk: $pk}})
+        RETURN child.dataset_name, child.column_name,
+               child.transform_type, child.expression, length(path) AS hops
+        ORDER BY hops ASC
+        """,
+        {"pk": pk},
+    )
+    fallback: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    while fallback_q.has_next():
+        r = fallback_q.get_next()
+        key = (str(r[0]), str(r[1]))
+        if key in seen:
+            continue
+        seen.add(key)
+        fallback.append({
+            "affected_table": r[0],
+            "affected_column": r[1],
+            "transform_type": r[2] or "",
+            "expression": r[3] or "",
+            "hops": int(r[4]),
+        })
+
+    # Try the agent. Any error → fallback path.
+    try:
+        from lineage.agents.impact_analyst import build as build_agent
+        agent = build_agent()
+        import json as _json
+        payload = _json.dumps({
+            "changed_table": table,
+            "changed_column": column,
+            "change_type": change_type,
+        })
+        result = agent.invoke({"messages": [{"role": "user", "content": payload}]})
+        # Pull the last AI message text.
+        text = ""
+        for msg in reversed(result.get("messages", []) or []):
+            content = getattr(msg, "content", None)
+            if isinstance(content, str) and content.strip():
+                text = content
+                break
+            if isinstance(content, list):
+                for blk in content:
+                    if isinstance(blk, dict) and blk.get("type") == "text":
+                        text = blk.get("text", "")
+                        if text.strip():
+                            break
+                if text:
+                    break
+        # Best-effort JSON extraction.
+        s = (text or "").strip()
+        if s.startswith("```"):
+            s = s.strip("`")
+            if s.lower().startswith("json"):
+                s = s[4:]
+            s = s.strip()
+            if s.endswith("```"):
+                s = s[:-3].strip()
+        start, end = s.find("{"), s.rfind("}")
+        if start != -1 and end > start:
+            return _json.loads(s[start : end + 1])
+        return {"error": "agent returned non-JSON response", "fallback": fallback, "raw": text}
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}", "fallback": fallback}
+
+
+@app.get("/api/lineage/process/{stage}/{run_id}")
+def lineage_process(stage: str, run_id: str):
+    """Process node detail: stage metadata, inputs, output, and per-column summary."""
+    c = kuzu_conn()
+    pk = f"{stage}::{run_id}"
+    head = c.execute(
+        """
+        MATCH (p:Process {pk: $pk})
+        RETURN p.stage, p.run_id, p.transform_type, p.target_table,
+               p.duration_ms, p.output_row_count, p.sql_hash, p.computed_at
+        """,
+        {"pk": pk},
+    )
+    if not head.has_next():
+        raise HTTPException(404, f"process not found: {stage}/{run_id}")
+    r = head.get_next()
+    head_payload = {
+        "stage": r[0], "run_id": r[1], "transform_type": r[2],
+        "target_table": r[3], "duration_ms": int(r[4]) if r[4] is not None else 0,
+        "output_row_count": int(r[5]) if r[5] is not None else 0,
+        "sql_hash": r[6] or "", "computed_at": r[7] or "",
+    }
+
+    inputs_q = c.execute(
+        """
+        MATCH (d:DataSet)-[:INPUT_TO]->(p:Process {pk: $pk})
+        RETURN d.name
+        """,
+        {"pk": pk},
+    )
+    input_tables = []
+    while inputs_q.has_next():
+        input_tables.append(str(inputs_q.get_next()[0]))
+
+    out_q = c.execute(
+        """
+        MATCH (p:Process {pk: $pk})-[:PRODUCES]->(d:DataSet)
+        RETURN d.name
+        """,
+        {"pk": pk},
+    )
+    output_table = head_payload["target_table"]
+    if out_q.has_next():
+        output_table = str(out_q.get_next()[0])
+
+    cols_q = c.execute(
+        f"""
+        MATCH (col:{COL_LABEL} {{dataset_name: $tbl}})
+        OPTIONAL MATCH (col)-[d:DERIVES_FROM]->(:{COL_LABEL})
+        RETURN col.column_name, col.transform_type, col.confidence,
+               col.semantic_description, count(d) AS source_count
+        ORDER BY col.column_name
+        """,
+        {"tbl": output_table},
+    )
+    out_cols: list[dict] = []
+    while cols_q.has_next():
+        r = cols_q.get_next()
+        out_cols.append({
+            "column": r[0],
+            "transform_type": r[1] or "",
+            "confidence": float(r[2]) if r[2] is not None else None,
+            "semantic_description": r[3] or "",
+            "source_count": int(r[4]) if r[4] is not None else 0,
+        })
+
+    return {
+        **head_payload,
+        "input_tables": input_tables,
+        "output_table": output_table,
+        "output_columns": out_cols,
+    }
+
+
+# ----------------------------------------------------------------------
+
 app.mount("/static", StaticFiles(directory=str(UI_ROOT / "static")), name="static")
 
 

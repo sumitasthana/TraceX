@@ -28,45 +28,14 @@ from pipeline.config import (  # noqa: E402
 STAGE_NAME = Path(__file__).stem
 OUTPUT_TABLE = "fct_customer_risk_profile"
 
-# Lineage manifest — Option B. This is documentation as much as it is a log event;
-# every key is a literal so it can be diffed in source control alongside the SQL.
-LINEAGE_MANIFEST: dict = {
-    "target_table": "fct_customer_risk_profile",
-    "source_tables": [
-        "stg_transaction_normalized",
-        "stg_customer_enriched",
-        "src_account",
-    ],
-    "depends_on_stages": ["02_stg_transactions", "03_stg_customers"],
-    "transform_type": "AGGREGATE_JOIN",
-    "derived_columns": {
-        "total_txn_volume_usd_90d":
-            "COALESCE(SUM(net_amount_usd) FILTER ("
-            "txn_date >= reference_date - INTERVAL 90 DAY), 0)",
-        "txn_count_90d":
-            "COUNT(*) FILTER (NOT is_reversal "
-            "AND txn_date >= reference_date - INTERVAL 90 DAY)",
-        "international_txn_ratio":
-            "CASE WHEN COUNT(txn_id)=0 THEN 0 "
-            "ELSE COUNT(*) FILTER (is_international) / COUNT(txn_id) END",
-        "avg_txn_amount_usd":
-            "COALESCE(AVG(net_amount_usd) FILTER (NOT is_reversal), 0)",
-        "reversal_rate":
-            "CASE WHEN COUNT(txn_id)=0 THEN 0 "
-            "ELSE COUNT(*) FILTER (is_reversal) / COUNT(txn_id) END",
-        "volume_percentile":
-            "PERCENT_RANK() OVER (ORDER BY total_txn_volume_usd_90d) "
-            "(second pass, after per-customer aggregation)",
-        "risk_score":
-            "0.4*international_txn_ratio "
-            "+ 0.3*(CASE WHEN kyc_stale_flag THEN 1.0 ELSE 0.0 END) "
-            "+ 0.2*volume_percentile "
-            "+ 0.1*reversal_rate",
-        "risk_tier":
-            "'HIGH' if risk_score > 0.65 else "
-            "'MEDIUM' if risk_score > 0.35 else 'LOW'",
-    },
-}
+# Source tables and stage dependencies are now consumed by manifest_builder
+# directly from the call site below — no hand-written lineage manifest dict.
+SOURCE_TABLES = [
+    "stg_transaction_normalized",
+    "stg_customer_enriched",
+    "src_account",
+]
+DEPENDS_ON_STAGES = ["02_stg_transactions", "03_stg_customers"]
 
 TRANSFORM_SQL = f"""
 CREATE OR REPLACE TABLE {OUTPUT_TABLE} AS
@@ -197,22 +166,45 @@ def main() -> int:
             acct_rows = table_row_count(con, "src_account")
             log.info(
                 "stage_start",
-                input_tables=LINEAGE_MANIFEST["source_tables"],
+                input_tables=SOURCE_TABLES,
                 stg_transaction_normalized_rows=txn_rows,
                 stg_customer_enriched_rows=cust_rows,
                 src_account_rows=acct_rows,
                 output_table=OUTPUT_TABLE,
             )
 
-            log.info("transform_start", **LINEAGE_MANIFEST, sql=TRANSFORM_SQL.strip())
+            log.info("transform_start", sql=TRANSFORM_SQL.strip())
             t0 = time.perf_counter()
             con.execute(TRANSFORM_SQL)
             output_rows = table_row_count(con, OUTPUT_TABLE)
+            transform_ms = int((time.perf_counter() - t0) * 1000)
             log.info(
                 "transform_complete",
                 output_row_count=output_rows,
-                duration_ms=int((time.perf_counter() - t0) * 1000),
+                duration_ms=transform_ms,
             )
+
+            try:
+                from lineage.manifest_builder import build_and_ingest  # noqa: E402
+                build_and_ingest(
+                    stage=STAGE_NAME,
+                    run_id=run_id,
+                    sql=TRANSFORM_SQL,
+                    target_table=OUTPUT_TABLE,
+                    source_tables=SOURCE_TABLES,
+                    depends_on_stages=DEPENDS_ON_STAGES,
+                    transform_type="AGGREGATE_JOIN",
+                    output_row_count=output_rows,
+                    duration_ms=transform_ms,
+                    con=con,
+                )
+            except Exception as exc:
+                log.warning(
+                    "lineage_manifest_invoke_failed",
+                    stage=STAGE_NAME,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
 
             (ref_date,) = con.execute(REF_DATE_SQL).fetchone()
             log.info("reference_date_resolved", reference_date=str(ref_date))
