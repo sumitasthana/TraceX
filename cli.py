@@ -117,6 +117,101 @@ def cmd_up(args: argparse.Namespace) -> int:
     return cmd_serve(args)
 
 
+# ── Catalog subcommands ───────────────────────────────────────────────────
+
+def _catalog_actor() -> str:
+    return os.environ.get("USER") or os.environ.get("USERNAME") or "cli"
+
+
+def cmd_catalog_seed(_args: argparse.Namespace) -> int:
+    _banner("Catalog — seed certifications + demo lineage")
+    sys.path.insert(0, str(REPO_ROOT))
+    from lineage.catalog.seed import seed
+    summary = seed()
+    print()
+    print(f"  certifications upserted : {summary['certifications_upserted']}")
+    print(f"  lineage rows seeded     : {summary['lineage_seeded']}")
+    print(f"  ts                      : {summary['ts']}")
+    print()
+    return 0
+
+
+def cmd_catalog_status(_args: argparse.Namespace) -> int:
+    sys.path.insert(0, str(REPO_ROOT))
+    from lineage.catalog.local import LocalCatalog
+    cat = LocalCatalog()
+    h = cat.health()
+    pending = cat.list_pending_reviews()
+    certs = cat.list_certifications()
+    print()
+    print(f"  lineage rows         : {h.get('lineage_count', 0)}")
+    print(f"  certifications       : {h.get('certification_count', 0)}")
+    print(f"  pending-review edges : {len(pending)}")
+    if certs:
+        print()
+        print("  Certifications:")
+        for c in certs:
+            print(f"    [{c['profile']}] {c['table_name']:35s} certified_at={c['certified_at']}")
+    if pending:
+        print()
+        print(f"  Pending ({len(pending)}):")
+        seen: set[tuple[str, str]] = set()
+        for e in pending:
+            key = (e.target_table, e.target_column)
+            if key in seen:
+                continue
+            seen.add(key)
+            print(f"    {e.target_table}.{e.target_column}  (source={e.source})")
+    print()
+    return 0
+
+
+def _split_table_column(arg: str) -> tuple[str, str]:
+    if "." not in arg:
+        raise SystemExit(f"expected <table>.<column>, got {arg!r}")
+    t, c = arg.split(".", 1)
+    return t.strip(), c.strip()
+
+
+def cmd_catalog_ratify(args: argparse.Namespace) -> int:
+    table, column = _split_table_column(args.target)
+    sys.path.insert(0, str(REPO_ROOT))
+    from lineage.catalog.local import LocalCatalog
+    cat = LocalCatalog()
+    cat.ratify(table, column, actor=_catalog_actor(), reason=args.reason or "")
+    print(f"  ratified  {table}.{column}  by={_catalog_actor()}")
+    return 0
+
+
+def cmd_catalog_reject(args: argparse.Namespace) -> int:
+    table, column = _split_table_column(args.target)
+    sys.path.insert(0, str(REPO_ROOT))
+    from lineage.catalog.local import LocalCatalog
+    cat = LocalCatalog()
+    cat.reject(table, column, actor=_catalog_actor(), reason=args.reason or "")
+    print(f"  rejected  {table}.{column}  by={_catalog_actor()}")
+    return 0
+
+
+def cmd_catalog_list_pending(_args: argparse.Namespace) -> int:
+    sys.path.insert(0, str(REPO_ROOT))
+    from lineage.catalog.local import LocalCatalog
+    cat = LocalCatalog()
+    rows = cat.list_pending_reviews()
+    if not rows:
+        print("\n  (no pending-review entries)\n")
+        return 0
+    print()
+    print(f"  {'TARGET':40s}  {'SOURCE':40s}  CONF  SOURCE_KIND")
+    print(f"  {'-'*40}  {'-'*40}  ----  -----------")
+    for e in rows:
+        target = f"{e.target_table}.{e.target_column}"
+        src = f"{e.source_table}.{e.source_column}" if e.source_table else "(unresolved)"
+        print(f"  {target:40s}  {src:40s}  {e.confidence:.2f}  {e.source}")
+    print()
+    return 0
+
+
 def cmd_status(_args: argparse.Namespace) -> int:
     def mark(p: Path) -> str:
         return "OK " if p.exists() else "-- "
@@ -163,6 +258,24 @@ def build_parser() -> argparse.ArgumentParser:
     up_p.add_argument("--host", default=os.environ.get("TRACEX_UI_HOST", "127.0.0.1"))
     up_p.add_argument("--port", type=int, default=int(os.environ.get("TRACEX_UI_PORT", "8765")))
     up_p.set_defaults(func=cmd_up)
+
+    # Catalog: nested subcommands
+    cat_p = sub.add_parser("catalog", help="catalog-layer admin (seed, status, ratify, reject)")
+    cat_sub = cat_p.add_subparsers(dest="catalog_cmd", required=True)
+
+    cat_sub.add_parser("seed", help="seed certifications + one ratified demo lineage entry").set_defaults(func=cmd_catalog_seed)
+    cat_sub.add_parser("status", help="catalog summary: certs, ratified, pending counts").set_defaults(func=cmd_catalog_status)
+    cat_sub.add_parser("list-pending", help="dump every pending-review edge").set_defaults(func=cmd_catalog_list_pending)
+
+    rat_p = cat_sub.add_parser("ratify", help="ratify <table>.<column>")
+    rat_p.add_argument("target", help="table.column to ratify")
+    rat_p.add_argument("--reason", default="", help="optional ratification reason")
+    rat_p.set_defaults(func=cmd_catalog_ratify)
+
+    rej_p = cat_sub.add_parser("reject", help="reject <table>.<column>")
+    rej_p.add_argument("target", help="table.column to reject")
+    rej_p.add_argument("--reason", default="", help="optional rejection reason")
+    rej_p.set_defaults(func=cmd_catalog_reject)
 
     return p
 

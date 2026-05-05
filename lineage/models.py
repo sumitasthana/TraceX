@@ -78,7 +78,14 @@ class ColumnLineageEdge:
 
 @dataclass
 class ColumnLineageMap:
-    """Full lineage for one output column of one stage."""
+    """Full lineage for one output column of one stage.
+
+    `source` and `review_state` carry provenance through the pipeline:
+      source ∈ {catalog, sqlglot, agent_inferred, unresolved}
+      review_state ∈ {ratified, pending_review}
+    Both default to the safest (unknown / pending) values; merge_lineage
+    promotes them per the precedence table.
+    """
     target_table: str
     target_column: str
     sources: List[ColumnLineageEdge]
@@ -88,6 +95,8 @@ class ColumnLineageMap:
     confidence: float = 1.0
     data_type: str = ""
     sql_hash: str = ""
+    source: str = "unresolved"
+    review_state: str = "pending_review"
 
 
 @dataclass

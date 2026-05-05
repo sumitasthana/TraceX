@@ -277,10 +277,26 @@ def build_and_ingest(
     ambiguous_count = 0
     agent_calls_made = 0
     enrichment_calls_made = 0
+    catalog_hits = 0
+    catalog_misses = 0
+    divergence_count = 0
     sql_hash_value = hash_sql(sql)
     skip_enrichment = bool(skip_enrichment) or _enrichment_disabled_via_env()
 
-    # 1. Deterministic parse
+    # ── Phase A: catalog lookup ──────────────────────────────────────────
+    from lineage.catalog.local import get_catalog
+    from lineage.catalog.client import REVIEW_RATIFIED
+    catalog = get_catalog()  # None when TRACEX_CATALOG=off
+    catalog_edges: list = []
+    if catalog is not None:
+        try:
+            catalog_edges = catalog.get_column_lineage(target_table)
+        except Exception as exc:
+            log.warning("lineage_catalog_unavailable",
+                        phase="get_column_lineage", error=str(exc))
+            catalog_edges = []
+
+    # ── Phase B: deterministic sqlglot parse ─────────────────────────────
     try:
         column_maps = sql_parse(sql, target_table=target_table, source_tables=source_tables)
     except Exception as exc:
@@ -292,28 +308,95 @@ def build_and_ingest(
         )
         column_maps = []
 
-    # 2. Resolve ambiguous maps via the sql_parser agent. Each invocation is
-    #    isolated — one failure does not block the rest.
+    # ── Phase C: agent resolution of ambiguous maps ──────────────────────
     skip_resolution = _resolution_disabled_via_env()
-    resolved: List[ColumnLineageMap] = []
+    agent_resolved: dict[tuple[str, str], ColumnLineageMap] = {}
     for cm in column_maps:
-        if cm.ambiguous:
-            ambiguous_count += 1
-            if not skip_resolution:
-                try:
-                    cm = _resolve_ambiguous(cm, sql=sql, target_table=target_table, log=log)
-                    agent_calls_made += 1
-                except Exception as exc:
-                    log.warning(
-                        "lineage_agent_failed",
-                        target_column=cm.target_column,
-                        error=str(exc),
-                    )
-                    cm.confidence = 0.5
-        # Always make sure the per-map sql_hash mirrors the stage SQL hash.
+        if not cm.ambiguous:
+            continue
+        ambiguous_count += 1
+        if skip_resolution:
+            continue
+
+        # Skip the agent when the catalog already has a ratified answer for
+        # this column — the catalog will win in Phase D anyway, so we save
+        # the Bedrock round-trip.
+        if any(
+            ce.target_table.lower() == cm.target_table.lower()
+            and ce.target_column.lower() == cm.target_column.lower()
+            and ce.review_state == REVIEW_RATIFIED
+            for ce in catalog_edges
+        ):
+            log.info("lineage_catalog_short_circuit",
+                     target_column=cm.target_column,
+                     reason="ratified catalog entry will be used")
+            continue
+
+        try:
+            resolved_cm = _resolve_ambiguous(cm, sql=sql, target_table=target_table, log=log)
+            agent_calls_made += 1
+            agent_resolved[(cm.target_table.lower(), cm.target_column.lower())] = resolved_cm
+        except Exception as exc:
+            log.warning(
+                "lineage_agent_failed",
+                target_column=cm.target_column,
+                error=str(exc),
+            )
+            cm.confidence = 0.5
+            agent_resolved[(cm.target_table.lower(), cm.target_column.lower())] = cm
+
+    # ── Phase D: merge with provenance precedence + divergence ───────────
+    from lineage.catalog.merge import merge_lineage
+    ratified_edges = [e for e in catalog_edges if e.review_state == REVIEW_RATIFIED]
+    resolved, divergences = merge_lineage(
+        catalog_edges=ratified_edges,
+        sqlglot_maps=column_maps,
+        agent_maps=agent_resolved,
+        sql_hash=sql_hash_value,
+    )
+
+    for cm in resolved:
         if not cm.sql_hash:
             cm.sql_hash = sql_hash_value
-        resolved.append(cm)
+        if cm.source == "catalog":
+            catalog_hits += 1
+            log.info("lineage_catalog_hit",
+                     target_table=cm.target_table,
+                     target_column=cm.target_column,
+                     review_state=cm.review_state)
+        else:
+            catalog_misses += 1
+
+    for d in divergences:
+        divergence_count += 1
+        log.warning(
+            "lineage_divergence",
+            stage=stage,
+            target_table=d.target_table,
+            target_column=d.target_column,
+            catalog_sources=d.catalog_sources,
+            sqlglot_sources=d.sqlglot_sources,
+            catalog_sql_hash=d.catalog_sql_hash,
+            current_sql_hash=d.current_sql_hash,
+        )
+        if catalog is not None:
+            try:
+                catalog.downgrade_to_pending(
+                    d.target_table, d.target_column,
+                    reason=(
+                        f"sqlglot disagrees with catalog "
+                        f"({sorted(d.catalog_sources)} vs {sorted(d.sqlglot_sources)})"
+                    ),
+                )
+            except Exception as exc:
+                log.warning("catalog_unavailable",
+                            phase="downgrade_to_pending", error=str(exc))
+
+    # When TRACEX_CATALOG=off we still want legacy behaviour: pretend
+    # everything is ratified so downstream UIs render normally.
+    if catalog is None:
+        for cm in resolved:
+            cm.review_state = "ratified"
 
     manifest = StageLineageManifest(
         stage=stage,
@@ -354,7 +437,7 @@ def build_and_ingest(
     import gc as _gc
     _gc.collect()
 
-    # 4. Enrichment — only on resolved maps with confidence >= 0.5.
+    # ── Phase F: enrichment (only on resolved maps with confidence >= 0.5) ──
     if not skip_enrichment:
         for cm in resolved:
             if cm.confidence < 0.5:
@@ -369,6 +452,17 @@ def build_and_ingest(
                     error=str(exc),
                 )
 
+    # ── Phase G: write back to catalog ────────────────────────────────────
+    # Fire-and-forget — never block on catalog responsiveness.
+    if catalog is not None:
+        try:
+            # Per-map source/review_state were set in Phase D; LocalCatalog
+            # honours those over the function-level params.
+            catalog.emit_lineage(manifest, source="sqlglot", auto_ratify=True)
+        except Exception as exc:
+            log.warning("catalog_unavailable",
+                        phase="emit_lineage", error=str(exc))
+
     log.info(
         "lineage_manifest_complete",
         stage=stage,
@@ -377,6 +471,10 @@ def build_and_ingest(
         ambiguous_count=ambiguous_count,
         agent_calls_made=agent_calls_made,
         enrichment_calls_made=enrichment_calls_made,
+        catalog_hits=catalog_hits,
+        catalog_misses=catalog_misses,
+        catalog_enabled=catalog is not None,
+        divergence_count=divergence_count,
         skipped_enrichment=skip_enrichment,
         sql_hash_prefix=sql_hash_value[:12],
         total_duration_ms=int((time.perf_counter() - started) * 1000),

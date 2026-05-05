@@ -113,6 +113,8 @@ EXTRA_COLUMN_PROPS = [
     (COL, "transform_type",       "STRING"),
     (COL, "data_type",            "STRING"),
     (COL, "sql_hash",             "STRING"),
+    (COL, "source",               "STRING"),  # catalog | sqlglot | agent_inferred | unresolved
+    (COL, "review_state",         "STRING"),  # ratified | pending_review
     ("Process", "sql_hash",       "STRING"),
 ]
 
@@ -319,17 +321,51 @@ class GraphBuilder:
         data_type: str = "",
         sql_hash: str = "",
         semantic_description: Optional[str] = None,
+        source: Optional[str] = None,
+        review_state: Optional[str] = None,
     ) -> None:
         """Upsert a Column node.
 
         Always sets the natural-key fields on CREATE. On MATCH, every property
         EXCEPT `semantic_description` is overwritten — that one is owned by
         the enrichment agent and would otherwise be wiped by every re-ingest.
-        Pass `semantic_description=""` (empty string, not None) to explicitly
-        clear it.
+
+        `review_state` follows the catalog principle: only the catalog (not
+        re-ingest) may flip a node from `ratified` back to `pending_review`.
+        If the caller would downgrade an existing ratified node, we keep the
+        old value and emit `lineage_review_downgrade_blocked`.
         """
         ts = computed_at or _utc_now_iso()
         pk = _column_pk(column_name, dataset_name)
+
+        existing_sd = (
+            semantic_description if semantic_description is not None
+            else self._existing_semantic_description(pk)
+        )
+        existing_state = self._existing_review_state(pk)
+        desired_state = (review_state or "").strip()
+        if not desired_state:
+            desired_state = existing_state or "pending_review"
+
+        # Preserve-on-downgrade for review_state.
+        if existing_state == "ratified" and desired_state == "pending_review":
+            self.log.info(
+                "lineage_review_downgrade_blocked",
+                column_name=column_name,
+                dataset_name=dataset_name,
+                attempted_state=desired_state,
+                preserved_state=existing_state,
+            )
+            desired_state = "ratified"
+
+        existing_source = self._existing_source(pk)
+        desired_source = (source or "").strip()
+        if not desired_source:
+            desired_source = existing_source or "unresolved"
+        # If we're preserving ratified, also preserve catalog provenance.
+        if existing_state == "ratified" and existing_source == "catalog" and desired_source != "catalog":
+            desired_source = existing_source
+
         params = {
             "pk": pk,
             "column_name": column_name,
@@ -341,13 +377,9 @@ class GraphBuilder:
             "confidence": float(confidence) if confidence is not None else 0.0,
             "data_type": data_type or "",
             "sql_hash": sql_hash or "",
-            # `MERGE ... ON MATCH SET` cannot conditionally branch in Kuzu.
-            # We pre-resolve: if caller passed None, look up the existing node
-            # and pass the current value back through so the SET is a no-op.
-            "semantic_description": (
-                semantic_description if semantic_description is not None
-                else self._existing_semantic_description(pk)
-            ),
+            "semantic_description": existing_sd,
+            "source": desired_source,
+            "review_state": desired_state,
         }
         self.conn.execute(
             f"""
@@ -361,18 +393,48 @@ class GraphBuilder:
                           c.confidence           = $confidence,
                           c.data_type            = $data_type,
                           c.sql_hash             = $sql_hash,
-                          c.semantic_description = $semantic_description
+                          c.semantic_description = $semantic_description,
+                          c.source               = $source,
+                          c.review_state         = $review_state
             ON MATCH  SET c.derivation           = $derivation,
                           c.expression           = $expression,
                           c.transform_type       = $transform_type,
                           c.confidence           = $confidence,
                           c.data_type            = $data_type,
                           c.sql_hash             = $sql_hash,
-                          c.semantic_description = $semantic_description
+                          c.semantic_description = $semantic_description,
+                          c.source               = $source,
+                          c.review_state         = $review_state
             """,
             params,
         )
         self.log.info("column_upserted", column_name=column_name, dataset_name=dataset_name)
+
+    def _existing_review_state(self, pk: str) -> str:
+        try:
+            r = self.conn.execute(
+                f"MATCH (c:{COL} {{pk: $pk}}) RETURN c.review_state",
+                {"pk": pk},
+            )
+            if r.has_next():
+                val = r.get_next()[0]
+                return str(val) if val else ""
+        except RuntimeError:
+            pass
+        return ""
+
+    def _existing_source(self, pk: str) -> str:
+        try:
+            r = self.conn.execute(
+                f"MATCH (c:{COL} {{pk: $pk}}) RETURN c.source",
+                {"pk": pk},
+            )
+            if r.has_next():
+                val = r.get_next()[0]
+                return str(val) if val else ""
+        except RuntimeError:
+            pass
+        return ""
 
     def _existing_semantic_description(self, pk: str) -> str:
         try:
@@ -398,8 +460,9 @@ class GraphBuilder:
         Used when ingesting a target column's edges: we need the source-column
         node to exist so the DERIVES_FROM edge has both endpoints, but we must
         NOT overwrite the rich properties (expression, transform_type, confidence,
-        data_type, sql_hash, semantic_description) that the source's own
-        producing stage may have already written. Hence ON CREATE SET only.
+        data_type, sql_hash, semantic_description, source, review_state) that
+        the source's own producing stage may have already written. Hence
+        ON CREATE SET only.
         """
         ts = computed_at or _utc_now_iso()
         pk = _column_pk(column_name, dataset_name)
@@ -415,7 +478,9 @@ class GraphBuilder:
                           c.confidence           = 0.0,
                           c.data_type            = '',
                           c.sql_hash             = '',
-                          c.semantic_description = ''
+                          c.semantic_description = '',
+                          c.source               = 'unresolved',
+                          c.review_state         = 'pending_review'
             """,
             {
                 "pk": pk,
@@ -652,6 +717,8 @@ class GraphBuilder:
             data_type=column_map.data_type,
             sql_hash=column_map.sql_hash,
             semantic_description=None,
+            source=getattr(column_map, "source", "unresolved"),
+            review_state=getattr(column_map, "review_state", "pending_review"),
         )
 
         for edge in column_map.sources:
