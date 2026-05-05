@@ -24,13 +24,19 @@ _db: Optional[kuzu.Database] = None
 
 
 def get_shared_db() -> kuzu.Database:
-    """Return the process-local Kuzu Database singleton."""
+    """Return the process-local Kuzu Database singleton.
+
+    Opened read-only so agents can run concurrently with the UI API server
+    and with each other without fighting over Kuzu's exclusive write lock.
+    Pipeline ingestion (graph_builder / config.get_db) holds the write lock
+    only during its own short window.
+    """
     global _db
     with _lock:
         if _db is None:
             path = get_graph_path()
             path.parent.mkdir(parents=True, exist_ok=True)
-            _db = kuzu.Database(str(path))
+            _db = kuzu.Database(str(path), read_only=True)
         return _db
 
 

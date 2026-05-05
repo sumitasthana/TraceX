@@ -73,7 +73,7 @@ def kuzu_conn() -> kuzu.Connection:
     if _kuzu_db is None:
         if not KUZU_PATH.exists():
             raise HTTPException(503, f"Kuzu graph not found at {KUZU_PATH}")
-        _kuzu_db = kuzu.Database(str(KUZU_PATH))
+        _kuzu_db = kuzu.Database(str(KUZU_PATH), read_only=True)
     return kuzu.Connection(_kuzu_db)
 
 
@@ -658,6 +658,137 @@ def _get_chat_agent():
         from lineage.agents.chat_supervisor import build as build_supervisor  # noqa: WPS433
         _chat_agent = build_supervisor()
     return _chat_agent
+
+
+def _friendly_tool_event(name: str, input_data: dict) -> str | None:
+    """Map a LangGraph on_tool_start event to a user-facing thinking line.
+
+    Returns None for tool events the user doesn't need to see.
+    """
+    n = (name or "").lower()
+    args = input_data or {}
+
+    # Supervisor delegation
+    if n == "ask_lineage_search":
+        return "Routing to Lineage Search specialist…"
+    if n == "ask_impact_analyst":
+        return "Routing to Impact Analyst specialist…"
+
+    # Lineage search tools
+    if n == "search_columns_by_text":
+        q = (args.get("query") or "").strip()[:60]
+        return f"Searching column descriptions for “{q}”…" if q else "Searching column descriptions…"
+    if n == "search_datasets_by_name":
+        q = (args.get("query") or "").strip()[:60]
+        return f"Searching table names for “{q}”…" if q else "Searching table names…"
+    if n == "get_columns_for_dataset":
+        t = (args.get("table_name") or "").strip()
+        return f"Reading columns of {t}…" if t else "Reading columns of dataset…"
+    if n == "get_column_detail":
+        t, c = (args.get("table") or "").strip(), (args.get("column") or "").strip()
+        return f"Reading details for {t}.{c}…" if t and c else "Reading column details…"
+
+    # Impact analyst tools
+    if n == "get_full_downstream_chain":
+        t, c = (args.get("table") or "").strip(), (args.get("column") or "").strip()
+        return f"Walking downstream chain of {t}.{c}…" if t and c else "Walking downstream chain…"
+    if n == "get_direct_downstream":
+        t, c = (args.get("table") or "").strip(), (args.get("column") or "").strip()
+        return f"Reading direct downstream of {t}.{c}…" if t and c else "Reading direct downstream…"
+    if n == "get_processes_reading_table":
+        t = (args.get("table") or "").strip()
+        return f"Finding processes that read {t}…" if t else "Finding upstream processes…"
+    if n == "get_column_expression":
+        t, c = (args.get("table") or "").strip(), (args.get("column") or "").strip()
+        return f"Reading expression of {t}.{c}…" if t and c else "Reading column expression…"
+
+    return None
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """Streaming variant of /api/chat — emits NDJSON events:
+
+      {"type":"thinking","text":"…"}        (one per significant tool call)
+      {"type":"final","response":"…", ...}  (final assistant message)
+      {"type":"error","message":"…"}        (terminal failure)
+
+    Frontend reads chunks and renders thinking bubbles in real time.
+    """
+    import time
+    from fastapi.responses import StreamingResponse  # noqa: WPS433
+
+    started = time.perf_counter()
+    conv_id = req.conversation_id or "default"
+
+    async def gen():
+        import json as _json
+
+        try:
+            agent = _get_chat_agent()
+            history = _chat_histories.get(conv_id, [])
+            if len(history) > MAX_HISTORY_TURNS * 2:
+                history = history[-(MAX_HISTORY_TURNS * 2):]
+
+            from langchain_core.messages import AIMessage, HumanMessage  # noqa: WPS433
+
+            messages = history + [HumanMessage(content=req.message)]
+
+            specialist_used = "unknown"
+            final_text = ""
+
+            async for event in agent.astream_events({"messages": messages}, version="v2"):
+                etype = event.get("event")
+                if etype == "on_tool_start":
+                    name = event.get("name", "")
+                    data = event.get("data", {}) or {}
+                    line = _friendly_tool_event(name, data.get("input") or {})
+                    if name in {"ask_lineage_search", "ask_impact_analyst"}:
+                        specialist_used = (
+                            "both"
+                            if specialist_used not in {"unknown", name.replace("ask_", "")}
+                            else name.replace("ask_", "")
+                        )
+                    if line:
+                        yield _json.dumps({"type": "thinking", "text": line}, ensure_ascii=False) + "\n"
+                elif etype == "on_chain_end":
+                    out = (event.get("data") or {}).get("output") or {}
+                    msgs = out.get("messages") if isinstance(out, dict) else None
+                    if isinstance(msgs, list):
+                        for m in reversed(msgs):
+                            content = getattr(m, "content", None)
+                            tc = getattr(m, "tool_calls", None)
+                            if isinstance(content, str) and content.strip() and not tc:
+                                final_text = content
+                                break
+                            if isinstance(content, list) and not tc:
+                                buf = []
+                                for blk in content:
+                                    if isinstance(blk, dict) and blk.get("type") == "text":
+                                        buf.append(blk.get("text", ""))
+                                joined = "".join(buf).strip()
+                                if joined:
+                                    final_text = joined
+                                    break
+
+            _chat_histories[conv_id] = messages + [AIMessage(content=final_text)]
+            yield _json.dumps({
+                "type": "final",
+                "response": final_text or "(no response)",
+                "conversation_id": conv_id,
+                "specialist_used": specialist_used,
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            }, ensure_ascii=False) + "\n"
+
+        except Exception as exc:
+            yield _json.dumps({
+                "type": "error",
+                "message": f"The lineage agent encountered an error: {exc}",
+                "conversation_id": conv_id,
+                "duration_ms": int((time.perf_counter() - started) * 1000),
+            }, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
 
 
 @app.post("/api/chat")

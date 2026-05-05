@@ -919,14 +919,7 @@ const App = (() => {
 const ChatPanel = (() => {
   let conversationId = null;
   let isOpen = false;
-  let seededSuggestions = false;
-
-  const SUGGESTIONS = [
-    "Where is customer risk score stored?",
-    "What breaks if I rename src_customer.ssn_hash?",
-    "Show me everything about KYC status",
-    "What depends on stg_fx_resolved.rate?",
-  ];
+  let activeThoughts = [];   // currently-rendered thinking bubbles, in order
 
   function drawer()   { return document.getElementById('chat-drawer'); }
   function messages() { return document.getElementById('chat-messages'); }
@@ -945,21 +938,7 @@ const ChatPanel = (() => {
     if (!d) return;
     d.classList.toggle('open',   isOpen);
     d.classList.toggle('closed', !isOpen);
-    if (isOpen && !seededSuggestions) seedSuggestions();
     if (isOpen) setTimeout(() => input()?.focus(), 280);
-  }
-
-  function seedSuggestions() {
-    seededSuggestions = true;
-    const el = document.createElement('div');
-    el.className = 'chat-msg chat-msg-assistant';
-    el.innerHTML =
-      `<div class="text-[12px] text-g-600 mb-2">What would you like to know?</div>` +
-      SUGGESTIONS.map(s =>
-        `<button type="button" class="chat-suggestion" onclick='ChatPanel.sendText(${JSON.stringify(s)})'>${escHtml(s)}</button>`
-      ).join('');
-    messages().appendChild(el);
-    scrollBottom();
   }
 
   // Render assistant message: highlight `table.column` patterns as chips,
@@ -998,6 +977,34 @@ const ChatPanel = (() => {
     return el;
   }
 
+  // Append a new green pulsating "thinking" bubble. Fade any prior bubbles
+  // in this turn to gray. Tracks them so we can vanish all at the end.
+  function appendThought(text) {
+    // Fade all prior active bubbles
+    activeThoughts.forEach(el => {
+      el.classList.remove('chat-thought-active');
+      el.classList.add('chat-thought-fade');
+    });
+    const el = document.createElement('div');
+    el.className = 'chat-thought chat-thought-active';
+    el.innerHTML = `<span class="chat-thought-dot"></span><span class="chat-thought-text"></span>`;
+    el.querySelector('.chat-thought-text').textContent = text;
+    messages().appendChild(el);
+    activeThoughts.push(el);
+    scrollBottom();
+  }
+
+  // Fade out and remove every thinking bubble accumulated this turn.
+  function vanishThoughts() {
+    const toRemove = activeThoughts.slice();
+    activeThoughts = [];
+    toRemove.forEach(el => {
+      el.classList.add('chat-thought-vanish');
+      // delay matches the CSS transition (.35s)
+      setTimeout(() => el.remove(), 380);
+    });
+  }
+
   function scrollBottom() {
     const m = messages();
     if (m) m.scrollTop = m.scrollHeight;
@@ -1019,20 +1026,56 @@ const ChatPanel = (() => {
     if (btn) btn.disabled = true;
 
     appendMessage(text, 'user');
-    const thinking = appendThinking();
+    appendThought('Thinking…');
 
     try {
-      const res = await fetch('/api/chat', {
+      const res = await fetch('/api/chat/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text, conversation_id: conversationId }),
       });
-      const data = await res.json();
-      conversationId = data.conversation_id || conversationId;
-      thinking.remove();
-      appendMessage(data.response || '(empty response)', 'assistant');
+      if (!res.ok || !res.body) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let finalShown = false;
+
+      // Read NDJSON: one JSON object per line
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buffer.indexOf('\n')) >= 0) {
+          const raw = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
+          if (!raw) continue;
+          let evt;
+          try { evt = JSON.parse(raw); } catch { continue; }
+
+          if (evt.type === 'thinking') {
+            appendThought(evt.text || '…');
+          } else if (evt.type === 'final') {
+            conversationId = evt.conversation_id || conversationId;
+            vanishThoughts();
+            appendMessage(evt.response || '(empty response)', 'assistant');
+            finalShown = true;
+          } else if (evt.type === 'error') {
+            vanishThoughts();
+            appendMessage(`Error: ${evt.message || 'unknown'}`, 'assistant');
+            finalShown = true;
+          }
+        }
+      }
+      if (!finalShown) {
+        vanishThoughts();
+        appendMessage('(stream ended without a final response)', 'assistant');
+      }
     } catch (err) {
-      thinking.remove();
+      vanishThoughts();
       appendMessage(`Error: ${err.message}`, 'assistant');
     } finally {
       inp.disabled = false;
