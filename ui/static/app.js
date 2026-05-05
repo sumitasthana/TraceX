@@ -258,83 +258,361 @@ const App = (() => {
     setLoading();
     try {
       const data = await api('/api/lineage/graph');
-      const datasets = data.nodes.filter(n => n.group === 'DataSet');
 
       const legend = `
         <div class="flex items-center gap-3 text-[11px] text-g-500">
-          <span class="flex items-center gap-1"><span class="dot" style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#0f766e"></span> L0 raw</span>
-          <span class="flex items-center gap-1"><span class="dot" style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#1d4ed8"></span> L1 staging</span>
-          <span class="flex items-center gap-1"><span class="dot" style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#6d28d9"></span> L2 facts</span>
-          <span class="flex items-center gap-1"><span class="dot" style="display:inline-block;width:9px;height:9px;border-radius:9999px;background:#0c1f3d"></span> Process</span>
+          <span class="flex items-center gap-1"><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#0f766e"></span> L0 raw</span>
+          <span class="flex items-center gap-1"><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#1d4ed8"></span> L1 staging</span>
+          <span class="flex items-center gap-1"><span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#6d28d9"></span> L2 facts</span>
+          <span class="flex items-center gap-1"><span style="display:inline-block;width:9px;height:9px;border-radius:9999px;background:#0c1f3d"></span> Process</span>
+          <span class="flex items-center gap-1"><span style="display:inline-block;width:8px;height:8px;border-radius:9999px;background:#94a3b8"></span> Column</span>
         </div>
       `;
 
       root.innerHTML = pageHeader(
         'Lineage Explorer',
-        `${data.nodes.length} nodes · ${data.edges.length} edges in tracex_graph`,
+        `${data.nodes.length} nodes · ${data.edges.length} edges · click any DataSet to explode its columns; click any Column to trace its source chain`,
         legend
       ) + `
         <div class="grid grid-cols-1 lg:grid-cols-4 gap-4 animate-fadein">
           <div class="lg:col-span-3">
-            <div id="lineage-canvas"></div>
-            <div class="text-[11px] text-g-400 mt-2">Click any node to inspect upstream/downstream &rarr;</div>
+            <div class="card p-2 relative">
+              <div class="absolute top-3 right-3 z-10 flex gap-1">
+                <button id="ln-collapse-all" class="btn-secondary text-[10px] px-2 py-1" type="button" title="Collapse all column expansions">Collapse</button>
+                <button id="ln-fit"          class="btn-secondary text-[10px] px-2 py-1" type="button" title="Re-fit graph to viewport">Fit</button>
+                <button id="ln-stabilize"    class="btn-secondary text-[10px] px-2 py-1" type="button" title="Re-run physics stabilisation">Re-layout</button>
+              </div>
+              <div id="lineage-canvas" style="height:600px; background:#fafbfd; border-radius:8px;"></div>
+            </div>
+            <div class="text-[11px] text-g-400 mt-2">Drag any node to reposition · click a DataSet to add its columns to the graph · click a Column to add its upstream chain.</div>
           </div>
           <div>
             <div class="card p-4">
-              <div class="text-[14px] font-semibold text-g-800 mb-3">DataSet</div>
+              <div class="text-[14px] font-semibold text-g-800 mb-3" id="ln-detail-title">Inspector</div>
               <div id="dataset-detail" class="text-[12px] text-g-500">Select a node on the graph.</div>
             </div>
           </div>
         </div>
       `;
 
-      // Build vis-network
+      // ── Build vis-network ─────────────────────────────────────────────
       const visNodes = new vis.DataSet(data.nodes.map(n => ({
         id: n.id,
         label: n.label,
         shape: n.shape,
-        color: { background: n.color, border: n.color },
-        font: { color: '#fff', face: 'DM Sans', size: 12 },
+        color: { background: n.color, border: n.color, highlight: { background: n.color, border: '#0c1f3d' } },
+        font: n.group === 'Process'
+          ? { color: '#fff', face: 'DM Mono', size: 11 }
+          : { color: '#fff', face: 'DM Sans', size: 12 },
         margin: 8,
         widthConstraint: { maximum: 180 },
-        ...(n.group === 'Process' ? { font: { color: '#fff', face: 'DM Mono', size: 11 } } : {}),
+        nodeKind: n.group,
+        baseColor: n.color,
+        layer: n.layer,
       })));
-      const visEdges = new vis.DataSet(data.edges.map(e => ({
+      const visEdges = new vis.DataSet(data.edges.map((e, i) => ({
+        id: `base::${i}`,
         from: e.from, to: e.to,
         arrows: 'to',
-        color: { color: e.color, opacity: .6 },
+        color: { color: e.color, opacity: .55 },
         width: 1,
         dashes: !!e.dashes,
       })));
 
+      const canvas = document.getElementById('lineage-canvas');
       const network = new vis.Network(
-        document.getElementById('lineage-canvas'),
+        canvas,
         { nodes: visNodes, edges: visEdges },
         {
-          layout: {
-            hierarchical: {
-              enabled: true,
-              direction: 'LR',
-              sortMethod: 'directed',
-              levelSeparation: 200,
-              nodeSpacing: 120,
+          layout: { hierarchical: { enabled: false } },
+          physics: {
+            enabled: true,
+            solver: 'forceAtlas2Based',
+            forceAtlas2Based: {
+              gravitationalConstant: -55,
+              centralGravity: 0.012,
+              springLength: 130,
+              springConstant: 0.07,
+              damping: 0.65,
+              avoidOverlap: 0.85,
             },
+            stabilization: { iterations: 220, fit: true },
           },
-          physics: { enabled: false },
-          interaction: { hover: true, dragNodes: true, zoomView: true },
+          interaction: {
+            hover: true, dragNodes: true, zoomView: true,
+            navigationButtons: false, multiselect: false, hideEdgesOnDrag: true,
+          },
+          nodes: { borderWidth: 1.5 },
+          edges: { smooth: { type: 'continuous', forceDirection: 'none' } },
         }
       );
 
+      // After initial stabilisation, freeze physics so user-drag is sticky.
+      // Re-enable temporarily whenever new column nodes are inserted so they
+      // settle around the parent dataset, then freeze again.
+      network.once('stabilizationIterationsDone', () => {
+        network.setOptions({ physics: { enabled: false } });
+      });
+
+      const expandedDatasets = new Set();   // ds::<name>
+      const expandedColumns  = new Set();   // col::<table>::<column>
+
+      function nudgePhysics(ms = 1500) {
+        network.setOptions({ physics: { enabled: true } });
+        setTimeout(() => network.setOptions({ physics: { enabled: false } }), ms);
+      }
+
+      function colId(table, column) { return `col::${table}::${column}`; }
+
+      function transformPalette(t) {
+        const tt = (t || '').toUpperCase();
+        return ({
+          PASSTHROUGH: '#475569',
+          RENAME:      '#475569',
+          TRANSFORM:   '#1d4ed8',
+          AGGREGATE:   '#6d28d9',
+          WINDOW:      '#0f766e',
+          CONSTANT:    '#94a3b8',
+          AMBIGUOUS:   '#b45309',
+        }[tt]) || '#64748b';
+      }
+
+      function addColumnNode(table, col, parentDsId) {
+        const id = colId(table, col.column);
+        if (visNodes.get(id)) return id;
+        const c = transformPalette(col.transform_type);
+        let baseX = 0, baseY = 0;
+        const parentPos = network.getPositions([parentDsId])[parentDsId];
+        if (parentPos) { baseX = parentPos.x; baseY = parentPos.y; }
+        visNodes.add({
+          id,
+          label: col.column,
+          shape: 'box',
+          color: { background: c, border: c, highlight: { background: c, border: '#0c1f3d' } },
+          font: { color: '#fff', face: 'DM Mono', size: 10 },
+          margin: 5,
+          widthConstraint: { maximum: 140 },
+          nodeKind: 'Column',
+          baseColor: c,
+          // small jitter so they fan out instead of stacking on the parent
+          x: baseX + (Math.random() - 0.5) * 60,
+          y: baseY + 80 + (Math.random() - 0.5) * 80,
+        });
+        visEdges.add({
+          id: `owns::${id}`,
+          from: parentDsId, to: id,
+          color: { color: '#cbd5e1', opacity: .65 },
+          dashes: [2, 4],
+          arrows: '',
+          width: 1,
+          smooth: false,
+        });
+        return id;
+      }
+
+      function removeColumnNode(table, column) {
+        const id = colId(table, column);
+        // Drop every edge that touches this column, then the node itself.
+        const linked = visEdges.get({
+          filter: e => e.from === id || e.to === id,
+        });
+        visEdges.remove(linked.map(e => e.id));
+        if (visNodes.get(id)) visNodes.remove(id);
+      }
+
+      // ── Dataset expansion ────────────────────────────────────────────
+      async function toggleDatasetColumns(dsId, datasetLabel) {
+        if (expandedDatasets.has(dsId)) {
+          // collapse
+          const cols = await api(`/api/lineage/dataset/${encodeURIComponent(datasetLabel)}/columns`);
+          (cols.columns || []).forEach(c => {
+            // also collapse any expanded chain rooted at this column
+            collapseColumnChain(datasetLabel, c.column, /*alsoRemoveColumnNode*/ true);
+          });
+          expandedDatasets.delete(dsId);
+          return;
+        }
+        const cols = await api(`/api/lineage/dataset/${encodeURIComponent(datasetLabel)}/columns`);
+        (cols.columns || []).forEach(col => addColumnNode(datasetLabel, col, dsId));
+        expandedDatasets.add(dsId);
+        nudgePhysics(2000);
+      }
+
+      // ── Column upstream-chain expansion ──────────────────────────────
+      async function toggleColumnChain(table, column) {
+        const myId = colId(table, column);
+        if (expandedColumns.has(myId)) {
+          collapseColumnChain(table, column, /*alsoRemoveColumnNode*/ false);
+          return;
+        }
+        const detail = await api(`/api/lineage/column/${encodeURIComponent(table)}/${encodeURIComponent(column)}`);
+        const chain = detail.upstream_chain || [];
+
+        // Add direct (hop=1) sources as column nodes; for deeper hops, add the
+        // node and an edge from its hop-1 predecessor (best-effort: link to the
+        // nearest already-present node by name).
+        chain.forEach(h => {
+          const srcId = colId(h.source_table, h.source_column);
+          if (!visNodes.get(srcId)) {
+            const c = transformPalette(h.transform_type);
+            const myPos = network.getPositions([myId])[myId] || { x: 0, y: 0 };
+            visNodes.add({
+              id: srcId,
+              label: `${h.source_column}\n${h.source_table}`,
+              shape: 'box',
+              color: { background: c, border: c, highlight: { background: c, border: '#0c1f3d' } },
+              font: { color: '#fff', face: 'DM Mono', size: 9, multi: true },
+              margin: 5,
+              widthConstraint: { maximum: 150 },
+              nodeKind: 'ColumnUpstream',
+              ownerTable: h.source_table,
+              ownerColumn: h.source_column,
+              addedFromColumn: myId,
+              x: myPos.x - 140 - (h.hop - 1) * 110 + (Math.random() - 0.5) * 40,
+              y: myPos.y + (Math.random() - 0.5) * 120,
+            });
+          }
+          // Edge from current column to its hop-1 source. For hops > 1, the
+          // chain query gave us a flat list; we wire the edge based on the
+          // shortest-path-like "this hop comes after that earlier hop"
+          // heuristic: join hop n to any hop n-1 we already inserted.
+          const edgeId = `chain::${myId}::${srcId}::${h.hop}`;
+          if (!visEdges.get(edgeId)) {
+            const tgtId = h.hop === 1
+              ? myId
+              : (chain.find(p => p.hop === h.hop - 1
+                                  && visNodes.get(colId(p.source_table, p.source_column)))
+                  ? colId(chain.find(p => p.hop === h.hop - 1).source_table,
+                          chain.find(p => p.hop === h.hop - 1).source_column)
+                  : myId);
+            visEdges.add({
+              id: edgeId,
+              from: tgtId, to: srcId,
+              arrows: 'to',
+              color: { color: '#94a3b8', opacity: .7 },
+              width: 1,
+              dashes: false,
+              smooth: { type: 'continuous' },
+              chainOf: myId,
+            });
+          }
+        });
+        expandedColumns.add(myId);
+        nudgePhysics(2000);
+      }
+
+      function collapseColumnChain(table, column, alsoRemoveColumnNode) {
+        const myId = colId(table, column);
+        // Remove every chain edge anchored on this column.
+        const chainEdges = visEdges.get({ filter: e => e.chainOf === myId });
+        const dropNodes = new Set();
+        chainEdges.forEach(e => { dropNodes.add(e.to); });
+        visEdges.remove(chainEdges.map(e => e.id));
+
+        // Drop nodes that were added BY this column's chain expansion AND have
+        // no other inbound edges still keeping them alive.
+        dropNodes.forEach(id => {
+          const node = visNodes.get(id);
+          if (!node || node.nodeKind !== 'ColumnUpstream') return;
+          if (node.addedFromColumn !== myId) return;
+          // safety: ensure no edges still reference this node
+          const stillLinked = visEdges.get({ filter: e => e.from === id || e.to === id });
+          if (stillLinked.length === 0) {
+            visNodes.remove(id);
+          }
+        });
+
+        expandedColumns.delete(myId);
+
+        if (alsoRemoveColumnNode) {
+          // also tear down this column itself if dataset is collapsing
+          removeColumnNode(table, column);
+        }
+      }
+
+      // ── Right-panel inspector ────────────────────────────────────────
+      const detailEl = document.getElementById('dataset-detail');
+      const titleEl  = document.getElementById('ln-detail-title');
+
+      async function showDataset(node) {
+        titleEl.textContent = 'DataSet';
+        renderDatasetDetail(node, detailEl);
+      }
+
+      async function showColumn(table, column) {
+        titleEl.textContent = 'Column';
+        detailEl.innerHTML = `<div class="text-[11px] text-g-400">Loading ${esc(table)}.${esc(column)}…</div>`;
+        try {
+          const detail = await api(`/api/lineage/column/${encodeURIComponent(table)}/${encodeURIComponent(column)}`);
+          detailEl.innerHTML = `
+            <div class="mb-2">
+              <div class="font-mono text-[12px] text-g-800">${esc(table)}.${esc(column)}</div>
+              <div class="mt-1 flex items-center gap-1">${transformBadge(detail.transform_type)}${confidenceBadge(detail.confidence)}</div>
+            </div>
+            ${renderColumnDefinition(detail)}`;
+        } catch (e) {
+          detailEl.innerHTML = `<div class="text-[12px] text-red-700">${esc(String(e))}</div>`;
+        }
+      }
+
+      function showProcess(node) {
+        titleEl.textContent = 'Process';
+        detailEl.innerHTML = `<div class="text-[12px] text-g-700"><span class="mono">${esc(node.label)}</span></div>`;
+      }
+
+      // ── Click router ──────────────────────────────────────────────────
       network.on('click', async (params) => {
         if (!params.nodes.length) return;
         const id = params.nodes[0];
-        const node = data.nodes.find(n => n.id === id);
-        if (!node || node.group !== 'DataSet') {
-          document.getElementById('dataset-detail').innerHTML =
-            `<div class="text-[12px] text-g-500">Process: <span class="mono text-g-800">${esc(node.label)}</span></div>`;
-          return;
+        const node = visNodes.get(id);
+        if (!node) return;
+
+        if (node.nodeKind === 'DataSet') {
+          await showDataset({ label: node.label, layer: node.layer, row_count: 0 });
+          await toggleDatasetColumns(id, node.label);
+        } else if (node.nodeKind === 'Column' || node.nodeKind === 'ColumnUpstream') {
+          // recover (table, column) — Column nodes have label = column,
+          // and we stashed the parent dataset via the owns:: edge target.
+          let table, column;
+          if (node.nodeKind === 'Column') {
+            // owns edge: from dsNode TO this column
+            const owns = visEdges.get({ filter: e => e.id === `owns::${id}` })[0];
+            const dsNode = owns ? visNodes.get(owns.from) : null;
+            table = dsNode ? dsNode.label : (id.split('::')[1] || '');
+            column = node.label;
+          } else {
+            table = node.ownerTable;
+            column = node.ownerColumn;
+          }
+          await showColumn(table, column);
+          await toggleColumnChain(table, column);
+        } else {
+          showProcess(node);
         }
-        renderDatasetDetail(node, document.getElementById('dataset-detail'));
+      });
+
+      // ── Toolbar buttons ───────────────────────────────────────────────
+      document.getElementById('ln-fit').addEventListener('click', () => {
+        network.fit({ animation: { duration: 350, easingFunction: 'easeInOutQuad' } });
+      });
+      document.getElementById('ln-stabilize').addEventListener('click', () => {
+        network.setOptions({ physics: { enabled: true } });
+        network.stabilize(150);
+        setTimeout(() => network.setOptions({ physics: { enabled: false } }), 1800);
+      });
+      document.getElementById('ln-collapse-all').addEventListener('click', () => {
+        // Drop every Column / ColumnUpstream node we ever added
+        const toRemove = visNodes.get({
+          filter: n => n.nodeKind === 'Column' || n.nodeKind === 'ColumnUpstream',
+        });
+        const toRemoveIds = new Set(toRemove.map(n => n.id));
+        const linkedEdges = visEdges.get({
+          filter: e => toRemoveIds.has(e.from) || toRemoveIds.has(e.to),
+        });
+        visEdges.remove(linkedEdges.map(e => e.id));
+        visNodes.remove(toRemove.map(n => n.id));
+        expandedDatasets.clear();
+        expandedColumns.clear();
       });
 
     } catch (e) { setError(e); }
