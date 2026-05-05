@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pipeline run outputs (regenerable)
+synthetic-data-layer1/logs/*.jsonl
+
+# Editor / IDE
+.vscode/
+.idea/

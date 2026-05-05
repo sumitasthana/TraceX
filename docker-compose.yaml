@@ -1,0 +1,30 @@
+version: "3.8"
+
+services:
+  janusgraph:
+    image: janusgraph/janusgraph:latest
+    container_name: tracex-janusgraph
+    environment:
+      JAVA_OPTIONS: "-Xms512m -Xmx1g"
+      janusgraph.storage.backend: berkeleyje
+      janusgraph.storage.directory: /var/lib/janusgraph/data
+      janusgraph.index.search.backend: lucene
+      janusgraph.index.search.directory: /var/lib/janusgraph/index
+      janusgraph.server.channelizer: org.janusgraph.channelizers.JanusGraphWsAndHttpChannelizer
+    ports:
+      - "8182:8182"
+    volumes:
+      - janusgraph-data:/var/lib/janusgraph
+    healthcheck:
+      # The janusgraph image doesn't ship curl/wget. Use bash's /dev/tcp probe to
+      # confirm the Gremlin port is accepting connections (sufficient for liveness;
+      # healthcheck.py does the deeper schema/smoke verification from the host).
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/8182' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s    # JanusGraph is slow on first boot
+
+volumes:
+  janusgraph-data:
+    driver: local

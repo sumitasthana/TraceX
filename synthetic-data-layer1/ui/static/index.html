@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TraceX · Data Lineage Intelligence</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans:  ["'DM Sans'", "system-ui", "sans-serif"],
+            mono:  ["'DM Mono'", "'JetBrains Mono'", "monospace"],
+          },
+          colors: {
+            navy:        "#0c1f3d",
+            "navy-mid":  "#1a3358",
+            "navy-light":"#e8eef7",
+            orange:      "#e85d20",
+            "g-50":  "#f9fafb",
+            "g-100": "#f3f4f6",
+            "g-200": "#e5e7eb",
+            "g-300": "#d1d5db",
+            "g-400": "#9ca3af",
+            "g-500": "#6b7280",
+            "g-600": "#4b5563",
+            "g-700": "#374151",
+            "g-800": "#1f2937",
+            "g-900": "#111827",
+            status: {
+              "green":       "#1a7f4b",
+              "green-light": "#e6f5ee",
+              "amber":       "#b45309",
+              "amber-light": "#fef3cd",
+              "red":         "#b91c1c",
+              "red-light":   "#fde8e8",
+              "blue":        "#1d4ed8",
+              "blue-light":  "#eff4ff",
+              "purple":      "#6d28d9",
+              "purple-light":"#f0ebff",
+              "teal":        "#0f766e",
+              "teal-light":  "#f0fdfa",
+            },
+          },
+        },
+      },
+    };
+  </script>
+
+  <link rel="stylesheet" href="/static/styles.css" />
+
+  <!-- vis-network for the lineage graph -->
+  <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+</head>
+<body class="font-sans bg-g-50 text-g-700 text-[13px] m-0">
+
+<!-- ============================================================ Topbar ====== -->
+<header class="topbar h-[52px] px-6 flex items-center justify-between" style="background:#0c1f3d; border-bottom:1px solid rgba(255,255,255,.06)">
+  <div class="flex items-center gap-3 text-white">
+    <div class="w-7 h-7 rounded-md flex items-center justify-center font-mono font-medium text-[13px]" style="background:#e85d20">Tx</div>
+    <div class="text-[14px] font-medium tracking-tight">
+      TraceX
+      <span class="text-white/55 font-light"> · Data Lineage Intelligence · Powered by Kuzu</span>
+    </div>
+  </div>
+  <div class="flex items-center gap-3">
+    <div id="run-status-pill" class="hidden"></div>
+    <button class="text-[11px] text-white/70 hover:text-white border border-white/20 rounded-md px-2.5 py-1" onclick="App.refresh()">Refresh</button>
+  </div>
+</header>
+
+<!-- ============================================================ Layout ====== -->
+<div class="flex" style="min-height: calc(100vh - 52px)">
+
+  <!-- Sidebar -->
+  <aside class="w-[220px] bg-white border-r border-g-200 shrink-0">
+    <nav class="px-3 py-4 flex flex-col gap-0.5" id="sidebar-nav">
+      <div class="text-[9px] font-semibold uppercase tracking-wider text-g-400 px-2.5 mb-1.5">Operate</div>
+      <button class="nav-btn" data-route="dashboard">Briefing</button>
+      <button class="nav-btn" data-route="runs">Pipeline Runs</button>
+      <button class="nav-btn" data-route="dq">DQ Console</button>
+
+      <div class="border-t border-g-100 my-2"></div>
+      <div class="text-[9px] font-semibold uppercase tracking-wider text-g-400 px-2.5 mb-1.5">Explore</div>
+      <button class="nav-btn" data-route="lineage">Lineage Explorer</button>
+      <button class="nav-btn" data-route="datasets">Datasets</button>
+
+      <div class="border-t border-g-100 my-2"></div>
+      <div class="text-[9px] font-semibold uppercase tracking-wider text-g-400 px-2.5 mb-1.5">Intelligence</div>
+      <button class="nav-btn" data-route="sar">SAR Candidates</button>
+    </nav>
+    <div class="px-5 py-3 border-t border-g-100 mt-2 text-[10px] text-g-400 font-light">
+      <div>tracex_layer0.duckdb</div>
+      <div>tracex_graph (Kuzu)</div>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <main class="flex-1 overflow-x-hidden">
+    <div class="p-6 max-w-[1280px] mx-auto" id="page-root">
+      <!-- Views render here. -->
+      <div class="text-g-400 text-[12px]">Loading…</div>
+    </div>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
