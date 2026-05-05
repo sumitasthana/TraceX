@@ -740,13 +740,16 @@ const App = (() => {
       ? `<div class="text-[10px] text-g-400 mt-1">+${d.upstream_chain.length - 8} more</div>` : '';
 
     const isSourceTable = String(d.table || '').startsWith('src_');
-    const noUpstream = !(d.upstream_chain || []).length;
-    const fallbackText = (isSourceTable && noUpstream)
-      ? 'Raw source-of-record column from a Layer 0 CSV — no upstream, nothing to enrich.'
-      : 'No semantic description (run with TRACEX_LINEAGE_AGENTS=on to enrich)';
+    // For src_* columns we expect a curated description from the catalog
+    // seed; if it's somehow missing, render nothing (the "No upstream"
+    // line below already says enough). For non-source columns, the
+    // enrichment hint is still actionable.
+    const fallback = isSourceTable
+      ? ''
+      : `<div class="text-[11px] text-g-400 italic">No semantic description (run with TRACEX_LINEAGE_AGENTS=on to enrich)</div>`;
     return `
       <div class="space-y-2">
-        ${sd ? `<div class="text-[12px] text-g-800 leading-snug">${esc(sd)}</div>` : `<div class="text-[11px] text-g-400 italic">${esc(fallbackText)}</div>`}
+        ${sd ? `<div class="text-[12px] text-g-800 leading-snug">${esc(sd)}</div>` : fallback}
         <div class="flex items-center gap-1.5 flex-wrap">
           ${sourceBadge(d.source)}
           ${reviewStateBadge(d.review_state)}

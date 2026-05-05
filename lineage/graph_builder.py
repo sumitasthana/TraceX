@@ -123,6 +123,41 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ── Source-of-record column metadata cache ───────────────────────────────
+# Loaded once per process: {table.column → data_type} for every src_* column
+# in the live DuckDB. Empty when DuckDB is unavailable; never raises.
+
+_SRC_COLUMN_TYPES: Optional[dict] = None
+
+
+def _load_src_column_types() -> dict:
+    global _SRC_COLUMN_TYPES
+    if _SRC_COLUMN_TYPES is not None:
+        return _SRC_COLUMN_TYPES
+    try:
+        import duckdb
+        from pipeline.config import get_db_path  # noqa: WPS433
+        path = get_db_path()
+        if not path.exists():
+            _SRC_COLUMN_TYPES = {}
+            return _SRC_COLUMN_TYPES
+        con = duckdb.connect(str(path), read_only=True)
+        try:
+            rows = con.execute(
+                """
+                SELECT table_name, column_name, data_type
+                FROM information_schema.columns
+                WHERE table_name LIKE 'src_%'
+                """,
+            ).fetchall()
+        finally:
+            con.close()
+        _SRC_COLUMN_TYPES = {f"{t}.{c}".lower(): str(d) for t, c, d in rows}
+    except Exception:
+        _SRC_COLUMN_TYPES = {}
+    return _SRC_COLUMN_TYPES
+
+
 def _is_already_exists(exc: Exception) -> bool:
     """Kuzu raises plain RuntimeError on catalog conflicts; sniff the message."""
     return "already exists" in str(exc).lower()
@@ -480,6 +515,21 @@ class GraphBuilder:
         }
 
         if is_source_table:
+            from lineage.catalog.source_columns import get_source_description  # noqa: WPS433
+            data_type = _load_src_column_types().get(
+                f"{dataset_name}.{column_name}".lower(), ""
+            )
+            curated_desc = get_source_description(dataset_name, column_name)
+
+            # Preserve any prior steward-written semantic_description over the
+            # canned curated text, but populate it on first sight.
+            existing_sd = self._existing_semantic_description(pk)
+            sd_to_write = existing_sd if existing_sd else curated_desc
+
+            params.update({
+                "data_type": data_type,
+                "semantic_description": sd_to_write,
+            })
             # Source-of-record: force catalog/ratified on every ingest.
             self.conn.execute(
                 f"""
@@ -491,14 +541,16 @@ class GraphBuilder:
                               c.expression           = '',
                               c.transform_type       = 'PASSTHROUGH',
                               c.confidence           = 1.0,
-                              c.data_type            = '',
+                              c.data_type            = $data_type,
                               c.sql_hash             = '',
-                              c.semantic_description = '',
+                              c.semantic_description = $semantic_description,
                               c.source               = 'catalog',
                               c.review_state         = 'ratified'
                 ON MATCH  SET c.source               = 'catalog',
                               c.review_state         = 'ratified',
-                              c.confidence           = 1.0
+                              c.confidence           = 1.0,
+                              c.data_type            = $data_type,
+                              c.semantic_description = $semantic_description
                 """,
                 params,
             )
