@@ -1,9 +1,9 @@
-# TraceX — Layer 1 (Staging) Pipeline
+# TraceX — Pipeline Reference
 
-Layer 1 sits on top of the Layer 0 raw-source DuckDB built in `../synthetic-data-layer0/`.
-It produces two staging tables — `stg_transaction_normalized` and `stg_customer_enriched` —
-plus a supporting `stg_fx_resolved` lookup. Every stage is an independent runnable process
-(Airflow / cron friendly) and emits structured JSON logs.
+Layer 1 (staging) and Layer 2 (facts) read from the Layer 0 raw-source DuckDB at
+`data/tracex_layer0.duckdb`. Layer 1 produces `stg_transaction_normalized` and
+`stg_customer_enriched` plus a supporting `stg_fx_resolved` lookup. Every stage is an
+independent runnable process (Airflow / cron friendly) and emits structured JSON logs.
 
 ## Layout
 
@@ -16,15 +16,17 @@ pipeline/
     01_stg_fx_normalize.py    # build stg_fx_resolved
     02_stg_transactions.py    # build stg_transaction_normalized
     03_stg_customers.py       # build stg_customer_enriched
+    10_fct_risk_profile.py    # build fct_customer_risk_profile
+    11_fct_sar_candidates.py  # build fct_regulatory_sar_candidates
     99_validate_outputs.py    # DQ gate over Layer 1 outputs (exits 1 on any fail)
 logs/                         # one {run_id}.jsonl per pipeline run (auto-created)
-requirements.txt
 ```
 
 ## Setup
 
+From the repo root:
+
 ```powershell
-cd synthetic-data-layer1
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -33,14 +35,15 @@ pip install -r requirements.txt
 The Layer 0 DuckDB file must already exist. If you haven't built it yet:
 
 ```powershell
-python ..\synthetic-data-layer0\load_duckdb.py
+python layer0\generate.py     # writes CSVs into data/layer0/
+python layer0\load_duckdb.py  # writes data/tracex_layer0.duckdb
 ```
 
 ## Environment variables
 
 | Variable          | Default                                                         | Meaning                                                              |
 |-------------------|-----------------------------------------------------------------|----------------------------------------------------------------------|
-| `TRACEX_DB_PATH`  | `..\synthetic-data-layer0\tracex_layer0.duckdb`                 | DuckDB file the pipeline reads/writes.                               |
+| `TRACEX_DB_PATH`  | `data\tracex_layer0.duckdb`                                     | DuckDB file the pipeline reads/writes.                               |
 | `TRACEX_LOG_DIR`  | `.\logs`                                                        | Where `{run_id}.jsonl` files are written.                            |
 | `TRACEX_RUN_ID`   | (unset → fresh UUID per process)                                | Set by the orchestrator so all stages in a run share a run_id.       |
 

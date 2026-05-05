@@ -1,0 +1,12 @@
+duckdb>=1.0.0
+structlog>=24.1.0
+python-dotenv>=1.0.0
+kuzu>=0.4.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
+# Layer 0 synthetic-data generator
+faker>=24.0.0
+
+# Graph healthcheck (JanusGraph / Gremlin)
+gremlinpython>=3.7.0

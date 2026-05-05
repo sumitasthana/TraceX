@@ -21,10 +21,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 LINEAGE_ROOT = Path(__file__).resolve().parent
-LAYER1_ROOT = LINEAGE_ROOT.parent
+REPO_ROOT = LINEAGE_ROOT.parent
 
-DEFAULT_GRAPH_PATH = LAYER1_ROOT / "tracex_graph"
-DEFAULT_LOG_DIR = LAYER1_ROOT / "logs"
+DEFAULT_GRAPH_PATH = REPO_ROOT / "data" / "tracex_graph"
+DEFAULT_LOG_DIR = REPO_ROOT / "logs"
 
 
 def get_graph_path() -> Path:

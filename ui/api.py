@@ -1,9 +1,9 @@
 """FastAPI backend for the TraceX UI.
 
 Reads directly from the artefacts the rest of the platform produces:
-    - DuckDB     synthetic-data-layer0/tracex_layer0.duckdb  (Layer 0/1/2 tables)
-    - Kuzu       synthetic-data-layer1/tracex_graph          (lineage graph)
-    - JSONL      synthetic-data-layer1/logs/{run_id}.jsonl   (pipeline runs)
+    - DuckDB     data/tracex_layer0.duckdb        (Layer 0/1/2 tables)
+    - Kuzu       data/tracex_graph                (lineage graph)
+    - JSONL      logs/{run_id}.jsonl              (pipeline runs)
 
 Endpoints:
     GET  /api/dashboard                  — top-level metrics for the briefing page
@@ -29,15 +29,14 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 UI_ROOT = Path(__file__).resolve().parent
-LAYER1_ROOT = UI_ROOT.parent
-REPO_ROOT = LAYER1_ROOT.parent
+REPO_ROOT = UI_ROOT.parent
 
-DUCKDB_PATH = REPO_ROOT / "synthetic-data-layer0" / "tracex_layer0.duckdb"
-KUZU_PATH = LAYER1_ROOT / "tracex_graph"
-LOGS_DIR = LAYER1_ROOT / "logs"
+DUCKDB_PATH = REPO_ROOT / "data" / "tracex_layer0.duckdb"
+KUZU_PATH = REPO_ROOT / "data" / "tracex_graph"
+LOGS_DIR = REPO_ROOT / "logs"
 
 # Make `from lineage.queries import ...` resolvable for shared graph helpers.
-sys.path.insert(0, str(LAYER1_ROOT))
+sys.path.insert(0, str(REPO_ROOT))
 from lineage.queries import (  # noqa: E402
     count_edges_by_label,
     count_nodes_by_label,

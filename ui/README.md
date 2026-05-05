@@ -21,7 +21,7 @@ artefacts — no separate data store.
 ## Run
 
 ```powershell
-cd C:\LangChain\TraceX\synthetic-data-layer1
+cd C:\LangChain\TraceX
 pip install -r requirements.txt
 python ui\serve.py
 # UI -> http://127.0.0.1:8765

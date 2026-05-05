@@ -6,8 +6,10 @@ from pathlib import Path
 
 import duckdb
 
-HERE = Path(__file__).resolve().parent
-DB_PATH = HERE / "tracex_layer0.duckdb"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / "data"
+CSV_DIR = DATA_DIR / "layer0"
+DB_PATH = DATA_DIR / "tracex_layer0.duckdb"
 
 # DuckDB-flavoured DDL: SERIAL -> INTEGER, NOW() -> CURRENT_TIMESTAMP, no separate index step needed
 # (DuckDB has its own PK/UNIQUE indexes; the secondary indexes from the Postgres DDL are added below).
@@ -132,7 +134,7 @@ def main() -> None:
         print("schema created")
 
         for table, csv_name in LOAD_ORDER:
-            csv_path = (HERE / csv_name).as_posix()
+            csv_path = (CSV_DIR / csv_name).as_posix()
             con.execute(
                 f"INSERT INTO {table} SELECT * FROM read_csv_auto(?, header=true, nullstr='')",
                 [csv_path],

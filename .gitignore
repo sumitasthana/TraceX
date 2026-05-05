@@ -11,7 +11,7 @@ venv/
 Thumbs.db
 
 # Pipeline run outputs (regenerable)
-synthetic-data-layer1/logs/*.jsonl
+logs/*.jsonl
 
 # Editor / IDE
 .vscode/

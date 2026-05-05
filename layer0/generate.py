@@ -21,6 +21,7 @@ import hashlib
 import os
 import random
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 from faker import Faker
 
@@ -38,7 +39,8 @@ END_DATE        = date(2023, 12, 31)
 CURRENCIES      = ["EUR", "GBP", "CAD", "MXN", "JPY", "CHF"]  # all → USD
 # ─────────────────────────────────────────────────────────
 
-OUT_DIR = "./data/layer0"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+OUT_DIR = str(REPO_ROOT / "data" / "layer0")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 def daterange(start, end):

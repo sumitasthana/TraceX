@@ -10,8 +10,8 @@ from pathlib import Path
 
 import uvicorn
 
-LAYER1_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(LAYER1_ROOT))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
 
 
 def main() -> None:

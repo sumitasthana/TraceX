@@ -21,10 +21,9 @@ load_dotenv()
 
 # ----- paths ---------------------------------------------------------------
 
-LAYER1_ROOT = Path(__file__).resolve().parent.parent
-REPO_ROOT = LAYER1_ROOT.parent
-DEFAULT_DB_PATH = REPO_ROOT / "synthetic-data-layer0" / "tracex_layer0.duckdb"
-DEFAULT_LOG_DIR = LAYER1_ROOT / "logs"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DB_PATH = REPO_ROOT / "data" / "tracex_layer0.duckdb"
+DEFAULT_LOG_DIR = REPO_ROOT / "logs"
 
 
 def get_db_path() -> Path:

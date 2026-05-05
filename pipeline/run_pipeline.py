@@ -15,8 +15,8 @@ import uuid
 from pathlib import Path
 
 PIPELINE_ROOT = Path(__file__).resolve().parent
-LAYER1_ROOT = PIPELINE_ROOT.parent
-sys.path.insert(0, str(LAYER1_ROOT))
+REPO_ROOT = PIPELINE_ROOT.parent
+sys.path.insert(0, str(REPO_ROOT))
 
 from pipeline.config import (  # noqa: E402
     configure_logging,
