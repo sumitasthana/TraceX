@@ -380,6 +380,43 @@ def _column_pk(column_name: str, dataset_name: str) -> str:
     return f"{dataset_name}::{column_name}"
 
 
+@app.get("/api/lineage/dataset/{name}/columns")
+def lineage_dataset_columns(name: str):
+    """Every Column node for a dataset, with the per-column source count.
+
+    Powers the click-to-expand drill-down in the Lineage Explorer + Datasets view.
+    """
+    c = kuzu_conn()
+    q = c.execute(
+        f"""
+        MATCH (col:{COL_LABEL} {{dataset_name: $name}})
+        OPTIONAL MATCH (col)-[d:DERIVES_FROM]->(:{COL_LABEL})
+        RETURN col.column_name, col.transform_type, col.confidence,
+               col.data_type, col.expression, col.semantic_description,
+               col.derivation, col.sql_hash, col.computed_at,
+               count(d) AS source_count
+        ORDER BY col.column_name
+        """,
+        {"name": name},
+    )
+    out: list[dict] = []
+    while q.has_next():
+        r = q.get_next()
+        out.append({
+            "column": r[0],
+            "transform_type": r[1] or "",
+            "confidence": float(r[2]) if r[2] is not None else None,
+            "data_type": r[3] or "",
+            "expression": r[4] or "",
+            "semantic_description": r[5] or "",
+            "derivation": r[6] or "",
+            "sql_hash": r[7] or "",
+            "computed_at": r[8] or "",
+            "source_count": int(r[9]) if r[9] is not None else 0,
+        })
+    return {"table": name, "columns": out}
+
+
 @app.get("/api/lineage/column/{table}/{column}")
 def lineage_column(table: str, column: str):
     """Full upstream chain for a single column across all hops."""

@@ -334,28 +334,160 @@ const App = (() => {
             `<div class="text-[12px] text-g-500">Process: <span class="mono text-g-800">${esc(node.label)}</span></div>`;
           return;
         }
-        const res = await api(`/api/lineage/dataset/${encodeURIComponent(node.label)}`);
-        const upstream = (res.upstream || []).map(u =>
-          `<li class="flex justify-between py-1.5 border-b border-g-100"><span class="font-mono text-[11px] text-g-700">${esc(u.upstream_table)}</span><span class="badge badge-gray">${esc(u.via_process)}</span></li>`
-        ).join('') || '<li class="text-g-400 text-[11px] py-1.5">none</li>';
-        const downstream = (res.downstream || []).map(d =>
-          `<li class="flex justify-between py-1.5 border-b border-g-100"><span class="font-mono text-[11px] text-g-700">${esc(d.downstream_table)}</span><span class="badge badge-gray">${esc(d.via_process)}</span></li>`
-        ).join('') || '<li class="text-g-400 text-[11px] py-1.5">none</li>';
-
-        document.getElementById('dataset-detail').innerHTML = `
-          <div class="mb-3">
-            <div class="font-mono text-[12px] text-g-800">${esc(node.label)}</div>
-            <div class="mt-1">${layerBadge(node.layer)}</div>
-            <div class="text-[11px] text-g-500 mt-1">row_count: ${fmtInt(node.row_count)}</div>
-          </div>
-          <div class="text-[10px] uppercase tracking-wider font-semibold text-g-400 mt-3 mb-1">Upstream</div>
-          <ul>${upstream}</ul>
-          <div class="text-[10px] uppercase tracking-wider font-semibold text-g-400 mt-3 mb-1">Downstream</div>
-          <ul>${downstream}</ul>
-        `;
+        renderDatasetDetail(node, document.getElementById('dataset-detail'));
       });
 
     } catch (e) { setError(e); }
+  }
+
+  // Render the Lineage Explorer side panel for a clicked DataSet node.
+  // Loads upstream/downstream + columns in parallel; each column row is
+  // click-to-expand into full schema + definition + first upstream hops.
+  async function renderDatasetDetail(node, container) {
+    container.innerHTML = `<div class="text-[12px] text-g-500">Loading ${esc(node.label)}…</div>`;
+    try {
+      const [neighbors, cols] = await Promise.all([
+        api(`/api/lineage/dataset/${encodeURIComponent(node.label)}`),
+        api(`/api/lineage/dataset/${encodeURIComponent(node.label)}/columns`),
+      ]);
+
+      const upstream = (neighbors.upstream || []).map(u =>
+        `<li class="flex justify-between py-1.5 border-b border-g-100"><span class="font-mono text-[11px] text-g-700">${esc(u.upstream_table)}</span><span class="badge badge-gray">${esc(u.via_process)}</span></li>`
+      ).join('') || '<li class="text-g-400 text-[11px] py-1.5">none</li>';
+      const downstream = (neighbors.downstream || []).map(d =>
+        `<li class="flex justify-between py-1.5 border-b border-g-100"><span class="font-mono text-[11px] text-g-700">${esc(d.downstream_table)}</span><span class="badge badge-gray">${esc(d.via_process)}</span></li>`
+      ).join('') || '<li class="text-g-400 text-[11px] py-1.5">none</li>';
+
+      const columnsHtml = renderColumnList(node.label, cols.columns || []);
+
+      container.innerHTML = `
+        <div class="mb-3">
+          <div class="font-mono text-[12px] text-g-800">${esc(node.label)}</div>
+          <div class="mt-1">${layerBadge(node.layer)}</div>
+          <div class="text-[11px] text-g-500 mt-1">row_count: ${fmtInt(node.row_count)}</div>
+        </div>
+        <div class="text-[10px] uppercase tracking-wider font-semibold text-g-400 mt-3 mb-1">Columns (${(cols.columns || []).length})</div>
+        ${columnsHtml}
+        <div class="text-[10px] uppercase tracking-wider font-semibold text-g-400 mt-4 mb-1">Upstream tables</div>
+        <ul>${upstream}</ul>
+        <div class="text-[10px] uppercase tracking-wider font-semibold text-g-400 mt-3 mb-1">Downstream tables</div>
+        <ul>${downstream}</ul>
+      `;
+
+      attachColumnHandlers(container, node.label);
+    } catch (e) {
+      container.innerHTML = `<div class="text-[12px] text-red-700">${esc(String(e))}</div>`;
+    }
+  }
+
+  // Compact, click-to-expand row per column. Wires .col-row click to
+  // attachColumnHandlers below.
+  function renderColumnList(table, columns) {
+    if (!columns.length) {
+      return '<div class="text-[11px] text-g-400 py-2">No column nodes ingested yet for this dataset.</div>';
+    }
+    return `<ul class="border border-g-100 rounded-md overflow-hidden">${
+      columns.map((c, i) => `
+        <li class="col-row border-b border-g-100 last:border-b-0" data-table="${esc(table)}" data-column="${esc(c.column)}" data-idx="${i}">
+          <button type="button" class="col-row-head w-full text-left px-2.5 py-1.5 hover:bg-g-50 flex items-center justify-between gap-2">
+            <span class="font-mono text-[11px] text-g-800 truncate">${esc(c.column)}</span>
+            <span class="flex items-center gap-1.5 shrink-0">
+              ${transformBadge(c.transform_type)}
+              ${confidenceBadge(c.confidence)}
+              <span class="text-[10px] text-g-400">${esc(c.data_type || '')}</span>
+            </span>
+          </button>
+          <div class="col-row-body hidden px-3 pb-3 pt-1 bg-g-50/40"></div>
+        </li>
+      `).join('')
+    }</ul>`;
+  }
+
+  function attachColumnHandlers(scope, table) {
+    scope.querySelectorAll('.col-row').forEach(li => {
+      const head = li.querySelector('.col-row-head');
+      const body = li.querySelector('.col-row-body');
+      head.addEventListener('click', async () => {
+        if (!body.classList.contains('hidden')) {
+          body.classList.add('hidden');
+          body.innerHTML = '';
+          return;
+        }
+        body.classList.remove('hidden');
+        body.innerHTML = '<div class="text-[11px] text-g-400">Loading…</div>';
+        const col = li.dataset.column;
+        try {
+          const detail = await api(`/api/lineage/column/${encodeURIComponent(table)}/${encodeURIComponent(col)}`);
+          body.innerHTML = renderColumnDefinition(detail);
+        } catch (e) {
+          body.innerHTML = `<div class="text-[11px] text-red-700">${esc(String(e))}</div>`;
+        }
+      });
+    });
+  }
+
+  // Full per-column inspector: schema fields, definition (expression),
+  // semantic description if present, and the first 6 upstream hops.
+  function renderColumnDefinition(d) {
+    const sd = (d.semantic_description || '').trim();
+    const expr = (d.expression || d.derivation || '').trim();
+    const chain = (d.upstream_chain || []).slice(0, 8).map(h =>
+      `<li class="py-1 border-b border-g-100 last:border-b-0">
+        <div class="flex items-center justify-between">
+          <span class="font-mono text-[10px] text-g-700">${esc(h.source_table)}.${esc(h.source_column)}</span>
+          <span class="flex items-center gap-1">${transformBadge(h.transform_type)}<span class="text-[10px] text-g-400">hop ${h.hop}</span></span>
+        </div>
+      </li>`
+    ).join('');
+    const more = (d.upstream_chain || []).length > 8
+      ? `<div class="text-[10px] text-g-400 mt-1">+${d.upstream_chain.length - 8} more</div>` : '';
+
+    return `
+      <div class="space-y-2">
+        ${sd ? `<div class="text-[12px] text-g-800 leading-snug">${esc(sd)}</div>` : `<div class="text-[11px] text-g-400 italic">No semantic description (run with TRACEX_LINEAGE_AGENTS=on to enrich)</div>`}
+        <div class="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px]">
+          <div><span class="text-g-400 uppercase tracking-wider">Type</span> <span class="mono text-g-700">${esc(d.transform_type || '—')}</span></div>
+          <div><span class="text-g-400 uppercase tracking-wider">Confidence</span> <span class="mono text-g-700">${d.confidence == null ? '—' : Number(d.confidence).toFixed(2)}</span></div>
+          <div><span class="text-g-400 uppercase tracking-wider">Data type</span> <span class="mono text-g-700">${esc(d.data_type || '—')}</span></div>
+          <div><span class="text-g-400 uppercase tracking-wider">SQL hash</span> <span class="mono text-g-500">${esc((d.sql_hash || '').slice(0,12) || '—')}</span></div>
+        </div>
+        ${expr ? `
+          <div>
+            <div class="text-[10px] uppercase tracking-wider text-g-400 mb-1">Definition</div>
+            <pre class="mono text-[10.5px] text-g-700 bg-white border border-g-100 rounded p-2 whitespace-pre-wrap break-words">${esc(expr)}</pre>
+          </div>` : ''}
+        ${chain ? `
+          <div>
+            <div class="text-[10px] uppercase tracking-wider text-g-400 mt-2 mb-1">Upstream chain</div>
+            <ul>${chain}</ul>
+            ${more}
+          </div>` : '<div class="text-[11px] text-g-400 italic">No upstream — source-table column.</div>'}
+      </div>`;
+  }
+
+  function transformBadge(t) {
+    const tt = (t || '').toUpperCase();
+    const palette = {
+      PASSTHROUGH: '#475569',
+      RENAME:      '#475569',
+      TRANSFORM:   '#1d4ed8',
+      AGGREGATE:   '#6d28d9',
+      WINDOW:      '#0f766e',
+      CONSTANT:    '#94a3b8',
+      AMBIGUOUS:   '#b45309',
+    };
+    if (!tt) return '<span class="text-[10px] text-g-400">—</span>';
+    const c = palette[tt] || '#475569';
+    return `<span style="display:inline-block;font-family:'DM Mono',monospace;font-size:9.5px;letter-spacing:.02em;background:${c};color:#fff;padding:1px 5px;border-radius:3px;">${esc(tt)}</span>`;
+  }
+
+  function confidenceBadge(v) {
+    if (v == null) return '';
+    const n = Number(v);
+    let bg = '#1a7f4b'; let label = n.toFixed(2);
+    if (n < 0.6) bg = '#b45309';
+    else if (n < 0.95) bg = '#1d4ed8';
+    return `<span style="display:inline-block;font-family:'DM Mono',monospace;font-size:9.5px;background:${bg};color:#fff;padding:1px 5px;border-radius:3px;">conf ${esc(label)}</span>`;
   }
 
   async function viewDatasets() {
@@ -363,23 +495,56 @@ const App = (() => {
     try {
       const rows = await api('/api/datasets');
       const tbody = rows.map(d => `
-        <tr>
-          <td class="mono">${esc(d.name)}</td>
+        <tr class="ds-row cursor-pointer hover:bg-g-50" data-name="${esc(d.name)}" data-layer="${esc(d.layer || '')}" data-row-count="${esc(String(d.row_count ?? 0))}">
+          <td class="mono"><span class="ds-caret inline-block w-3 text-g-400">▸</span> ${esc(d.name)}</td>
           <td>${layerBadge(d.layer)}</td>
           <td class="text-right mono">${fmtInt(d.row_count)}</td>
           <td class="mono text-g-500">${esc(d.computed_at || '—')}</td>
           <td class="text-right">
-            <a href="#/lineage" class="btn-secondary">View in graph</a>
+            <a href="#/lineage" class="btn-secondary" onclick="event.stopPropagation()">View in graph</a>
           </td>
+        </tr>
+        <tr class="ds-body hidden" data-for="${esc(d.name)}">
+          <td colspan="5" class="bg-g-50/40 p-3"><div class="ds-body-content text-[12px] text-g-500">Click to expand columns…</div></td>
         </tr>
       `).join('');
 
-      root.innerHTML = pageHeader('Datasets', `${rows.length} DataSet vertices in lineage graph`)
+      root.innerHTML = pageHeader('Datasets', `${rows.length} DataSet vertices · click any row to expand columns`)
         + `<div class="card animate-fadein"><table class="tbl">
             <thead><tr><th>Name</th><th>Layer</th><th class="text-right">Row count</th><th>Computed at</th><th></th></tr></thead>
             <tbody>${tbody || '<tr><td colspan="5" class="text-g-400">no datasets</td></tr>'}</tbody>
           </table></div>`;
+
+      root.querySelectorAll('.ds-row').forEach(tr => {
+        tr.addEventListener('click', async () => {
+          const name = tr.dataset.name;
+          const body = root.querySelector(`.ds-body[data-for="${cssEscape(name)}"]`);
+          const caret = tr.querySelector('.ds-caret');
+          if (!body) return;
+          if (!body.classList.contains('hidden')) {
+            body.classList.add('hidden');
+            if (caret) caret.textContent = '▸';
+            return;
+          }
+          body.classList.remove('hidden');
+          if (caret) caret.textContent = '▾';
+          const content = body.querySelector('.ds-body-content');
+          content.innerHTML = '<div class="text-[11px] text-g-400">Loading…</div>';
+          try {
+            const cols = await api(`/api/lineage/dataset/${encodeURIComponent(name)}/columns`);
+            content.innerHTML = renderColumnList(name, cols.columns || []);
+            attachColumnHandlers(content, name);
+          } catch (e) {
+            content.innerHTML = `<div class="text-[11px] text-red-700">${esc(String(e))}</div>`;
+          }
+        });
+      });
     } catch (e) { setError(e); }
+  }
+
+  function cssEscape(s) {
+    if (window.CSS && window.CSS.escape) return window.CSS.escape(s);
+    return String(s).replace(/"/g, '\\"');
   }
 
   async function viewDQ() {
