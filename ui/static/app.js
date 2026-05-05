@@ -570,6 +570,7 @@ const App = (() => {
         if (node.nodeKind === 'DataSet') {
           await showDataset({ label: node.label, layer: node.layer, row_count: 0 });
           await toggleDatasetColumns(id, node.label);
+          ChatPanel.suggestDataset(node.label);
         } else if (node.nodeKind === 'Column' || node.nodeKind === 'ColumnUpstream') {
           // recover (table, column) — Column nodes have label = column,
           // and we stashed the parent dataset via the owns:: edge target.
@@ -910,6 +911,148 @@ const App = (() => {
 
   // Public surface
   return { dispatch, bindNav, refresh };
+})();
+
+// =====================================================================
+// Chat Panel — slide-in drawer wired to /api/chat
+// =====================================================================
+const ChatPanel = (() => {
+  let conversationId = null;
+  let isOpen = false;
+  let seededSuggestions = false;
+
+  const SUGGESTIONS = [
+    "Where is customer risk score stored?",
+    "What breaks if I rename src_customer.ssn_hash?",
+    "Show me everything about KYC status",
+    "What depends on stg_fx_resolved.rate?",
+  ];
+
+  function drawer()   { return document.getElementById('chat-drawer'); }
+  function messages() { return document.getElementById('chat-messages'); }
+  function input()    { return document.getElementById('chat-input'); }
+  function sendBtn()  { return document.querySelector('.chat-send-btn'); }
+
+  function escHtml(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c =>
+      ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])
+    );
+  }
+
+  function toggle() {
+    isOpen = !isOpen;
+    const d = drawer();
+    if (!d) return;
+    d.classList.toggle('open',   isOpen);
+    d.classList.toggle('closed', !isOpen);
+    if (isOpen && !seededSuggestions) seedSuggestions();
+    if (isOpen) setTimeout(() => input()?.focus(), 280);
+  }
+
+  function seedSuggestions() {
+    seededSuggestions = true;
+    const el = document.createElement('div');
+    el.className = 'chat-msg chat-msg-assistant';
+    el.innerHTML =
+      `<div class="text-[12px] text-g-600 mb-2">What would you like to know?</div>` +
+      SUGGESTIONS.map(s =>
+        `<button type="button" class="chat-suggestion" onclick='ChatPanel.sendText(${JSON.stringify(s)})'>${escHtml(s)}</button>`
+      ).join('');
+    messages().appendChild(el);
+    scrollBottom();
+  }
+
+  // Render assistant message: highlight `table.column` patterns as chips,
+  // convert **bold** to <strong>, convert newlines to <br>, basic numbered lists.
+  function renderAssistant(text) {
+    let s = escHtml(text);
+    // **bold**
+    s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    // `table.column` or `column_name` → teal chip
+    s = s.replace(/`([a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)?)`/gi,
+      '<span class="col-ref">$1</span>');
+    // newlines
+    s = s.replace(/\n/g, '<br>');
+    return s;
+  }
+
+  function appendMessage(text, role) {
+    const el = document.createElement('div');
+    el.className = `chat-msg chat-msg-${role}`;
+    if (role === 'assistant') {
+      el.innerHTML = renderAssistant(text);
+    } else {
+      el.textContent = text;
+    }
+    messages().appendChild(el);
+    scrollBottom();
+    return el;
+  }
+
+  function appendThinking() {
+    const el = document.createElement('div');
+    el.className = 'chat-msg-thinking';
+    el.textContent = 'Searching lineage graph…';
+    messages().appendChild(el);
+    scrollBottom();
+    return el;
+  }
+
+  function scrollBottom() {
+    const m = messages();
+    if (m) m.scrollTop = m.scrollHeight;
+  }
+
+  async function sendText(text) {
+    const inp = input();
+    if (inp) inp.value = text;
+    await send();
+  }
+
+  async function send() {
+    const inp = input();
+    const btn = sendBtn();
+    const text = (inp?.value || '').trim();
+    if (!text) return;
+    inp.value = '';
+    inp.disabled = true;
+    if (btn) btn.disabled = true;
+
+    appendMessage(text, 'user');
+    const thinking = appendThinking();
+
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: text, conversation_id: conversationId }),
+      });
+      const data = await res.json();
+      conversationId = data.conversation_id || conversationId;
+      thinking.remove();
+      appendMessage(data.response || '(empty response)', 'assistant');
+    } catch (err) {
+      thinking.remove();
+      appendMessage(`Error: ${err.message}`, 'assistant');
+    } finally {
+      inp.disabled = false;
+      if (btn) btn.disabled = false;
+      inp.focus();
+    }
+  }
+
+  // Pre-populate the chat from the Lineage Explorer when a DataSet node is
+  // clicked. Opens the drawer if closed, fills the input but does NOT send.
+  function suggestDataset(datasetName) {
+    if (!isOpen) toggle();
+    const inp = input();
+    if (!inp) return;
+    inp.value = `Tell me about the ${datasetName} table`;
+    inp.focus();
+    inp.setSelectionRange(inp.value.length, inp.value.length);
+  }
+
+  return { toggle, send, sendText, suggestDataset };
 })();
 
 window.addEventListener('hashchange', App.dispatch);

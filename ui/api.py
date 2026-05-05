@@ -26,6 +26,7 @@ import kuzu
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 UI_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = UI_ROOT.parent
@@ -633,6 +634,98 @@ def lineage_process(stage: str, run_id: str):
         "output_table": output_table,
         "output_columns": out_cols,
     }
+
+
+# ----------------------------------------------------------------------
+# Chat endpoint — routes through chat_supervisor → lineage_search / impact_analyst
+# ----------------------------------------------------------------------
+
+
+class ChatRequest(BaseModel):
+    message: str
+    conversation_id: Optional[str] = None
+
+
+_chat_agent = None
+_chat_histories: dict[str, list] = {}
+MAX_HISTORY_TURNS = 10
+
+
+def _get_chat_agent():
+    """Lazily build the chat supervisor on first request and reuse across calls."""
+    global _chat_agent
+    if _chat_agent is None:
+        from lineage.agents.chat_supervisor import build as build_supervisor  # noqa: WPS433
+        _chat_agent = build_supervisor()
+    return _chat_agent
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest):
+    import time
+
+    started = time.perf_counter()
+    conv_id = req.conversation_id or "default"
+
+    try:
+        agent = _get_chat_agent()
+        history = _chat_histories.get(conv_id, [])
+
+        # Trim to MAX_HISTORY_TURNS pairs (user + assistant = 1 turn).
+        if len(history) > MAX_HISTORY_TURNS * 2:
+            history = history[-(MAX_HISTORY_TURNS * 2):]
+
+        from langchain_core.messages import AIMessage, HumanMessage  # noqa: WPS433
+
+        messages = history + [HumanMessage(content=req.message)]
+        result = await agent.ainvoke({"messages": messages})
+
+        # Pull the last AI message text — first reverse hit with no tool_calls.
+        response_text = ""
+        for msg in reversed(result.get("messages", [])):
+            content = getattr(msg, "content", None)
+            if isinstance(content, str) and content.strip() and not getattr(msg, "tool_calls", None):
+                response_text = content
+                break
+            if isinstance(content, list) and not getattr(msg, "tool_calls", None):
+                buf = []
+                for blk in content:
+                    if isinstance(blk, dict) and blk.get("type") == "text":
+                        buf.append(blk.get("text", ""))
+                joined = "".join(buf).strip()
+                if joined:
+                    response_text = joined
+                    break
+
+        # Sniff which specialist(s) were dispatched.
+        specialist_used = "unknown"
+        for msg in result.get("messages", []):
+            calls = getattr(msg, "tool_calls", None) or []
+            for call in calls:
+                name = call.get("name", "") if isinstance(call, dict) else getattr(call, "name", "")
+                if "lineage_search" in name:
+                    specialist_used = "both" if specialist_used == "impact_analyst" else "lineage_search"
+                elif "impact_analyst" in name:
+                    specialist_used = "both" if specialist_used == "lineage_search" else "impact_analyst"
+
+        # Persist trimmed history (human turn + final AI turn).
+        _chat_histories[conv_id] = messages + [AIMessage(content=response_text)]
+
+        return {
+            "response": response_text or "(no response)",
+            "conversation_id": conv_id,
+            "specialist_used": specialist_used,
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+        }
+
+    except Exception as exc:  # never raise out of the chat endpoint
+        return {
+            "response": f"The lineage agent encountered an error: {exc}",
+            "conversation_id": conv_id,
+            "specialist_used": "error",
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+            "error": True,
+        }
 
 
 # ----------------------------------------------------------------------

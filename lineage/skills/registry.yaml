@@ -13,3 +13,8 @@ skills:
     path: impact_analysis/SKILL.md
     trigger_patterns: ["impact", "breaking change", "rename", "downstream"]
     priority: 10
+
+  - name: lineage_search
+    path: lineage_search/SKILL.md
+    trigger_patterns: ["find column", "where is", "which table", "business concept", "data discovery"]
+    priority: 10
