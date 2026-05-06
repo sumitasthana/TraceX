@@ -1041,7 +1041,18 @@ async def chat(req: ChatRequest):
 
 # ----------------------------------------------------------------------
 
-app.mount("/static", StaticFiles(directory=str(UI_ROOT / "static")), name="static")
+# Disable caching on static assets so users see the latest app.js / styles.css
+# without manual hard-refresh. The dataset is small enough that re-fetching on
+# every navigation is fine; production would want hashed filenames instead.
+class _NoCacheStaticFiles(StaticFiles):
+    async def get_response(self, path, scope):  # type: ignore[override]
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+
+app.mount("/static", _NoCacheStaticFiles(directory=str(UI_ROOT / "static")), name="static")
 
 
 @app.get("/")
