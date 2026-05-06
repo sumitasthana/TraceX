@@ -156,8 +156,27 @@ def bootstrap(default_business_date: str | None = None) -> list[dict]:
     return summary
 
 
+def _parse_args(argv=None):
+    import argparse
+    p = argparse.ArgumentParser(
+        description="Migrate existing src_* tables in DuckDB into landing/.",
+    )
+    p.add_argument(
+        "--business-date",
+        default=None,
+        help="ISO YYYY-MM-DD; if set, every partition is stamped at this date "
+             "(overrides per-table MAX(event_date) inference). Use this when "
+             "you want one as_of_date to cover the whole snapshot.",
+    )
+    return p.parse_args(argv)
+
+
 def main() -> int:
-    summary = bootstrap()
+    args = _parse_args()
+    if args.business_date:
+        # Sanity-check the format so a typo fails loud.
+        _dt.date.fromisoformat(args.business_date)
+    summary = bootstrap(default_business_date=args.business_date)
     # Print a compact summary table. ASCII-only for Windows cp1252 stdout.
     sys.stdout.write("\n  Landing-zone bootstrap\n  " + "-" * 76 + "\n")
     sys.stdout.write(f"  {'TABLE':18s} {'SOR':14s} {'ENTITY':14s} {'BUSINESS_DATE':14s} {'ROWS':>8s}  SHA\n")

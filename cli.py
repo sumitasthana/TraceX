@@ -70,9 +70,12 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
     return _run(cmd)
 
 
-def cmd_bootstrap_landing(_args: argparse.Namespace) -> int:
+def cmd_bootstrap_landing(args: argparse.Namespace) -> int:
     _banner("Landing — bootstrap parquet partitions from existing src_* tables")
-    return _run([PYTHON, str(REPO_ROOT / "scripts" / "bootstrap_landing.py")])
+    cmd = [PYTHON, str(REPO_ROOT / "scripts" / "bootstrap_landing.py")]
+    if getattr(args, "business_date", None):
+        cmd += ["--business-date", args.business_date]
+    return _run(cmd)
 
 
 def cmd_ingest(args: argparse.Namespace) -> int:
@@ -256,9 +259,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("generate", help="generate Layer 0 synthetic CSVs").set_defaults(func=cmd_generate)
     sub.add_parser("load",     help="load CSVs into DuckDB").set_defaults(func=cmd_load)
-    sub.add_parser("bootstrap-landing",
-                   help="migrate existing src_* tables into landing/ tree (one-shot)"
-                   ).set_defaults(func=cmd_bootstrap_landing)
+    bl_p = sub.add_parser(
+        "bootstrap-landing",
+        help="migrate existing src_* tables into landing/ tree (one-shot)",
+    )
+    bl_p.add_argument(
+        "--business-date",
+        help="stamp every partition at this date (YYYY-MM-DD) instead of "
+             "inferring per-table; recommended on first run so you have a "
+             "single as_of_date for the whole snapshot.",
+    )
+    bl_p.set_defaults(func=cmd_bootstrap_landing)
     pipe_p = sub.add_parser("pipeline", help="run staging + facts pipeline (date-anchored)")
     pipe_p.add_argument("--as-of-date", required=True,
                         help="business date (YYYY-MM-DD)")
