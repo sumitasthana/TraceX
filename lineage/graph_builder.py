@@ -290,8 +290,22 @@ class GraphBuilder:
     def _upsert_dataset(
         self, name: str, row_count: int = 0, computed_at: str = ""
     ) -> None:
+        """Upsert a DataSet node.
+
+        Preserve-on-stub: source-side calls pass `row_count=0` because the
+        caller doesn't know the true count of an upstream table. If a real
+        count is already in the graph (from the producing stage's manifest),
+        keep it — never let a stub write zero over a real non-zero value.
+        """
         layer = self._infer_layer(name)
         ts = computed_at or _utc_now_iso()
+        rc_in = int(row_count)
+        if rc_in == 0:
+            existing = self._existing_dataset_row_count(name)
+            rc_to_write = existing  # might still be 0; that's fine
+        else:
+            rc_to_write = rc_in
+
         self.conn.execute(
             """
             MERGE (d:DataSet {name: $name})
@@ -300,9 +314,22 @@ class GraphBuilder:
                           d.computed_at = $computed_at
             ON MATCH  SET d.row_count = $row_count
             """,
-            {"name": name, "layer": layer, "row_count": int(row_count), "computed_at": ts},
+            {"name": name, "layer": layer, "row_count": rc_to_write, "computed_at": ts},
         )
-        self.log.info("dataset_upserted", name=name, layer=layer, row_count=int(row_count))
+        self.log.info("dataset_upserted", name=name, layer=layer, row_count=rc_to_write)
+
+    def _existing_dataset_row_count(self, name: str) -> int:
+        try:
+            r = self.conn.execute(
+                "MATCH (d:DataSet {name: $name}) RETURN d.row_count",
+                {"name": name},
+            )
+            if r.has_next():
+                val = r.get_next()[0]
+                return int(val) if val is not None else 0
+        except RuntimeError:
+            pass
+        return 0
 
     def _upsert_process(
         self, manifest: LineageManifest, metrics: Optional[StageMetrics]
