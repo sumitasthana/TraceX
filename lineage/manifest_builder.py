@@ -413,6 +413,18 @@ def build_and_ingest(
     )
 
     # 3. Graph ingest — wrapped so failure here doesn't crash the stage.
+    # Reset the agents' read-only Kuzu pool first: a prior call's enrichment
+    # phase may have cached a read-only Database in this process, which
+    # blocks the subsequent write-mode `kuzu.Database(path)` here with a
+    # "Could not set lock on file" IOException.
+    try:
+        from lineage.agents._kuzu_pool import reset_shared_db as _reset_pool
+        _reset_pool()
+    except Exception:
+        pass
+    import gc as _gc
+    _gc.collect()
+
     builder = None
     try:
         builder = GraphBuilder(run_id=run_id)
@@ -434,7 +446,6 @@ def build_and_ingest(
     # Drop our reference and force a GC pass so the Kuzu Database file lock is
     # released BEFORE the enrichment loop starts opening its own connections.
     builder = None
-    import gc as _gc
     _gc.collect()
 
     # ── Phase F: enrichment (only on resolved maps with confidence >= 0.5) ──

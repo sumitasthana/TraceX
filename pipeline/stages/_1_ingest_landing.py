@@ -242,7 +242,22 @@ def _promote_to_src(con, validations: list, log) -> dict[str, int]:
             [src_table],
         ).fetchone()
         if exists:
-            con.execute(f"INSERT INTO {src_table} SELECT * FROM {raw_table}")
+            # Use raw_* column list explicitly so we tolerate schema drift
+            # (e.g. legacy `business_date` left on src_branch from a prior
+            # run that used hive_partitioning=true). Any extra columns on
+            # src_* not present in raw_* are left at NULL (or default).
+            raw_cols = [
+                r[0] for r in con.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = ? ORDER BY ordinal_position",
+                    [raw_table],
+                ).fetchall()
+            ]
+            col_list = ", ".join(f'"{c}"' for c in raw_cols)
+            con.execute(
+                f"INSERT INTO {src_table} ({col_list}) "
+                f"SELECT {col_list} FROM {raw_table}"
+            )
         else:
             con.execute(f"CREATE TABLE {src_table} AS SELECT * FROM {raw_table}")
 

@@ -212,6 +212,24 @@ def main() -> int:
             )
 
             # Ensure the historised table exists with the right shape.
+            # If a legacy version of the table exists (pre-historisation,
+            # no `as_of_date` column), drop it so CREATE TABLE rebuilds
+            # with the partition key. This makes the schema migration
+            # idempotent across any number of re-runs.
+            existing_cols = {
+                r[0] for r in con.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = ?",
+                    [OUTPUT_TABLE],
+                ).fetchall()
+            }
+            if existing_cols and "as_of_date" not in existing_cols:
+                log.warning(
+                    "fct_legacy_schema_dropped",
+                    table=OUTPUT_TABLE,
+                    reason="no as_of_date column; pre-historisation shape",
+                )
+                con.execute(f"DROP TABLE {OUTPUT_TABLE}")
             con.execute(CREATE_TABLE_SQL)
 
             log.info("transform_start", sql=transform_sql.strip())
