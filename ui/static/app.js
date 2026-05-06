@@ -684,15 +684,15 @@ const App = (() => {
     return `<ul class="border border-g-100 rounded-md overflow-hidden">${
       columns.map((c, i) => `
         <li class="col-row border-b border-g-100 last:border-b-0" data-table="${esc(table)}" data-column="${esc(c.column)}" data-idx="${i}">
-          <button type="button" class="col-row-head w-full text-left px-2.5 py-1.5 hover:bg-g-50 flex items-center justify-between gap-2">
-            <span class="font-mono text-[11px] text-g-800 truncate">${esc(c.column)}</span>
-            <span class="flex items-center gap-1.5 shrink-0 flex-wrap">
+          <button type="button" class="col-row-head w-full text-left px-2.5 py-2 hover:bg-g-50 block">
+            <div class="font-mono text-[11.5px] text-g-800 truncate" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(c.column)}</div>
+            <div class="flex items-center gap-1.5 flex-wrap mt-1">
               ${transformBadge(c.transform_type)}
               ${sourceBadge(c.source)}
               ${reviewStateBadge(c.review_state)}
               ${confidenceBadge(c.confidence)}
-              <span class="text-[10px] text-g-400">${esc(c.data_type || '')}</span>
-            </span>
+              ${c.data_type ? `<span class="text-[10px] text-g-400 font-mono">${esc(c.data_type)}</span>` : ''}
+            </div>
           </button>
           <div class="col-row-body hidden px-3 pb-3 pt-1 bg-g-50/40"></div>
         </li>
