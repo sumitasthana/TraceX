@@ -2,16 +2,22 @@
 
 Every stage script and the orchestrator import from here so logging is configured the same way
 everywhere and run_id flows through a single pipeline run no matter how it is invoked.
+
+The pipeline is now date-anchored: every run requires a `TRACEX_AS_OF_DATE` (set by the
+orchestrator from `--as-of-date`) so the same input + same date produce byte-identical
+output. Stages reach for `get_as_of_date()` instead of `CURRENT_DATE` / `CURRENT_TIMESTAMP`
+inside their SQL.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import logging
 import os
 import sys
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional
 
 import duckdb
 import structlog
@@ -42,6 +48,53 @@ def get_run_id() -> str:
     rid = str(uuid.uuid4())
     os.environ["TRACEX_RUN_ID"] = rid
     return rid
+
+
+def get_as_of_date() -> _dt.date:
+    """Return the pipeline's business `as_of_date` from `TRACEX_AS_OF_DATE`.
+
+    Required — raises `RuntimeError` if unset. The orchestrator MUST set this
+    from its `--as-of-date YYYY-MM-DD` argument before dispatching subprocesses.
+    Using a getter (instead of reading env directly inside SQL strings) keeps
+    one place to fail loudly when the contract is violated.
+    """
+    raw = os.environ.get("TRACEX_AS_OF_DATE")
+    if not raw:
+        raise RuntimeError(
+            "TRACEX_AS_OF_DATE is unset. The pipeline is now date-anchored — "
+            "invoke the orchestrator with `--as-of-date YYYY-MM-DD`."
+        )
+    try:
+        return _dt.date.fromisoformat(raw.strip())
+    except ValueError as exc:
+        raise RuntimeError(
+            f"TRACEX_AS_OF_DATE={raw!r} is not a valid ISO date (YYYY-MM-DD): {exc}"
+        ) from exc
+
+
+def get_current_run_metadata() -> dict:
+    """Read-only snapshot of the current run's identity, for stages that want to log
+    run context. Returns `{run_id, as_of_date, started_at}` from env + the registry.
+    `started_at` is None when no `pipeline_runs` row exists yet (e.g. standalone stage)."""
+    run_id = os.environ.get("TRACEX_RUN_ID") or ""
+    aod = os.environ.get("TRACEX_AS_OF_DATE") or ""
+    started_at: Optional[str] = None
+    db_path = get_db_path()
+    if db_path.exists() and run_id:
+        try:
+            con = duckdb.connect(str(db_path), read_only=True)
+            try:
+                row = con.execute(
+                    "SELECT started_at FROM pipeline_runs WHERE run_id = ?",
+                    [run_id],
+                ).fetchone()
+                if row:
+                    started_at = str(row[0])
+            finally:
+                con.close()
+        except Exception:
+            started_at = None
+    return {"run_id": run_id, "as_of_date": aod, "started_at": started_at}
 
 
 # ----- logging -------------------------------------------------------------
