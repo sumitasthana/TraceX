@@ -1094,136 +1094,186 @@ const App = (() => {
     try {
       const data = await api('/api/lineage/graph');
 
-      // Dedupe Process nodes by stage label so the diagram doesn't fan out
-      // by run_id. Keep the latest run_id per stage (Kuzu doesn't give us
-      // computed_at on the graph endpoint, so "latest" = the last one
-      // encountered, which is good enough for a snapshot view).
+      // ── Bucket nodes ─────────────────────────────────────────────────
+      // Dedupe processes by stage label.
       const procByStage = new Map();
       data.nodes.forEach(n => {
         if (n.group === 'Process') procByStage.set(n.label, n);
       });
-      const keptProcIds = new Set(Array.from(procByStage.values()).map(n => n.id));
+      const procs = Array.from(procByStage.values())
+        .sort((a, b) => a.label.localeCompare(b.label));
 
-      const filteredNodes = data.nodes.filter(n =>
-        n.group !== 'Process' || keptProcIds.has(n.id)
-      );
-      const filteredEdges = data.edges.filter(e => {
-        if (e.from.startsWith('proc::') && !keptProcIds.has(e.from)) return false;
-        if (e.to.startsWith('proc::')   && !keptProcIds.has(e.to))   return false;
-        return true;
-      });
+      const datasets = data.nodes.filter(n => n.group === 'DataSet');
+      const dsByLayer = {
+        layer_0: datasets.filter(d => d.layer === 'layer_0').sort((a,b)=>a.label.localeCompare(b.label)),
+        layer_1: datasets.filter(d => d.layer === 'layer_1').sort((a,b)=>a.label.localeCompare(b.label)),
+        layer_2: datasets.filter(d => d.layer === 'layer_2').sort((a,b)=>a.label.localeCompare(b.label)),
+      };
 
-      const visNodes = new vis.DataSet(filteredNodes.map(n => {
-        if (n.group === 'DataSet') {
-          return {
-            id: n.id,
-            label: n.label,
-            shape: 'box',
-            color: { background: n.color, border: n.color,
-                     highlight: { background: n.color, border: '#0c1f3d' } },
-            font: { color: '#fff', face: 'DM Sans', size: 13 },
-            margin: 12,
-            widthConstraint: { minimum: 150, maximum: 220 },
-            shapeProperties: { borderRadius: 6 },
-            nodeKind: 'DataSet',
-            layer: n.layer,
-          };
+      // Split processes into "0→1" (produces L1) vs "1→2" (produces L2)
+      // by looking at the PRODUCES edge target's layer.
+      const procToTargetLayer = new Map();
+      data.edges.forEach(e => {
+        if (e.from.startsWith('proc::') && e.to.startsWith('ds::')) {
+          const proc = data.nodes.find(n => n.id === e.from);
+          const tgt  = data.nodes.find(n => n.id === e.to);
+          if (proc && tgt && procByStage.get(proc.label)?.id === proc.id) {
+            procToTargetLayer.set(proc.id, tgt.layer);
+          }
         }
-        return {
-          id: n.id,
-          label: n.label,
-          shape: 'ellipse',
-          color: { background: '#fff', border: '#0c1f3d',
-                   highlight: { background: '#e8eef7', border: '#0c1f3d' } },
-          font: { color: '#0c1f3d', face: 'DM Mono', size: 11 },
-          borderWidth: 2,
-          margin: 10,
-          widthConstraint: { minimum: 130, maximum: 220 },
-          nodeKind: 'Process',
-        };
-      }));
+      });
+      const procs01 = procs.filter(p => procToTargetLayer.get(p.id) === 'layer_1');
+      const procs12 = procs.filter(p => procToTargetLayer.get(p.id) === 'layer_2');
 
-      const visEdges = new vis.DataSet(filteredEdges.map((e, i) => ({
-        id: `flow::${i}`,
-        from: e.from, to: e.to,
-        arrows: { to: { enabled: true, scaleFactor: 0.7 } },
-        color: { color: '#94a3b8', opacity: 0.75 },
-        width: 1.4,
-        smooth: { type: 'cubicBezier', forceDirection: 'horizontal', roundness: 0.45 },
-      })));
+      // ── Render shell ────────────────────────────────────────────────
+      const totalCols = datasets.reduce((acc, d) => {
+        // Most datasets carry row_count we can show; sum just for the metric.
+        acc += 0;  // placeholder; we sum columns from DOM later if we wanted
+        return acc;
+      }, 0);
 
-      const swimlanes = `
-        <div class="flow-swimlanes">
-          <div class="flow-band" style="background:rgba(15,118,110,.10);color:#0f766e">L0 — raw sources</div>
-          <div class="flow-arrow">→</div>
-          <div class="flow-band" style="background:rgba(12,31,61,.06);color:#0c1f3d">0 → 1 transforms</div>
-          <div class="flow-arrow">→</div>
-          <div class="flow-band" style="background:rgba(29,78,216,.10);color:#1d4ed8">L1 — staging</div>
-          <div class="flow-arrow">→</div>
-          <div class="flow-band" style="background:rgba(12,31,61,.06);color:#0c1f3d">1 → 2 transform</div>
-          <div class="flow-arrow">→</div>
-          <div class="flow-band" style="background:rgba(109,40,217,.10);color:#6d28d9">L2 — facts (gold)</div>
+      const dsCard = (n) => `
+        <div class="flow-card layer-${n.layer === 'layer_0' ? '0' : n.layer === 'layer_1' ? '1' : '2'}"
+             data-id="${esc(n.id)}" data-label="${esc(n.label)}" data-kind="DataSet">
+          <div class="card-name">${esc(n.label)}</div>
+          <div class="card-meta">
+            <span class="card-tag">${esc(n.layer.replace('layer_', 'L'))}</span>
+            ${n.row_count ? `<span class="card-row-count">${fmtInt(n.row_count)} rows</span>` : ''}
+          </div>
         </div>`;
 
-      root.innerHTML = pageHeader(
-        'Pipeline Flow',
-        `${filteredNodes.filter(n => n.group === 'DataSet').length} datasets and ${procByStage.size} stages, snapshotted left-to-right`,
-        ''
-      ) + `
-        <div class="card animate-fadein">
-          ${swimlanes}
-          <div class="card p-2 relative" style="border:none;box-shadow:none">
-            <div class="absolute top-3 right-3 z-10 flex gap-1">
-              <button id="flow-fit"       type="button" class="btn-secondary text-[10px] px-2 py-1">Fit</button>
-              <button id="flow-relayout"  type="button" class="btn-secondary text-[10px] px-2 py-1">Re-layout</button>
+      const procCard = (n) => `
+        <div class="flow-card is-process"
+             data-id="${esc(n.id)}" data-label="${esc(n.label)}" data-kind="Process">
+          <div class="card-name">${esc(n.label)}</div>
+          <div class="card-meta">
+            <span class="card-tag">${esc(n.transform_type || 'process')}</span>
+            ${n.duration_ms ? `<span class="card-row-count">${fmtInt(n.duration_ms)}ms</span>` : ''}
+          </div>
+        </div>`;
+
+      root.innerHTML = `
+        <div class="flow-shell animate-fadein">
+          <div>
+            <div class="flow-title">Pipeline Flow</div>
+            <div class="flow-sub">Raw CSVs → staging tables → fact tables. One card per artefact, one process per stage.</div>
+          </div>
+
+          <div class="flow-stats">
+            <div class="flow-stat"><span class="num">${fmtInt(dsByLayer.layer_0.length)}</span><span class="label">Sources</span></div>
+            <div class="flow-stat"><span class="num">${fmtInt(procs.length)}</span><span class="label">Stages</span></div>
+            <div class="flow-stat"><span class="num">${fmtInt(dsByLayer.layer_1.length)}</span><span class="label">Staging tables</span></div>
+            <div class="flow-stat"><span class="num">${fmtInt(dsByLayer.layer_2.length)}</span><span class="label">Fact tables</span></div>
+            <div class="flow-stat"><span class="num">${fmtInt(data.edges.length)}</span><span class="label">Edges</span></div>
+          </div>
+
+          <div class="flow-layer-strip">
+            <div class="flow-layer-head l0">L0 · Raw sources</div>
+            <div class="flow-layer-head proc">0 → 1 transforms</div>
+            <div class="flow-layer-head l1">L1 · Staging</div>
+            <div class="flow-layer-head proc">1 → 2 transform</div>
+            <div class="flow-layer-head l2">L2 · Facts</div>
+          </div>
+
+          <div id="flow-board" class="flow-board">
+            <svg class="flow-svg" id="flow-svg" preserveAspectRatio="none"></svg>
+
+            <div class="flow-col" id="col-l0">
+              ${dsByLayer.layer_0.map(dsCard).join('')}
             </div>
-            <div id="flow-canvas" style="height:600px; background:#fafbfd; border-radius:8px;"></div>
+            <div class="flow-col" id="col-p01">
+              ${procs01.map(procCard).join('')}
+            </div>
+            <div class="flow-col" id="col-l1">
+              ${dsByLayer.layer_1.map(dsCard).join('')}
+            </div>
+            <div class="flow-col" id="col-p12">
+              ${procs12.map(procCard).join('')}
+            </div>
+            <div class="flow-col" id="col-l2">
+              ${dsByLayer.layer_2.map(dsCard).join('')}
+            </div>
           </div>
-          <div class="px-4 py-2 text-[11px] text-g-500" style="border-top:1px solid var(--g-100)">
-            Click any node to open it in the Lineage Explorer for column-level drill-down.
+
+          <div class="flow-legend">
+            <span><span class="swatch l0"></span>L0 source-of-record</span>
+            <span><span class="swatch l1"></span>L1 staging</span>
+            <span><span class="swatch l2"></span>L2 fact / gold</span>
+            <span><span class="swatch proc"></span>process</span>
+            <span style="margin-left:auto;color:#64748b">Click any card to open it in the Lineage Explorer.</span>
           </div>
         </div>`;
 
-      const network = new vis.Network(
-        document.getElementById('flow-canvas'),
-        { nodes: visNodes, edges: visEdges },
-        {
-          layout: {
-            hierarchical: {
-              enabled: true,
-              direction: 'LR',
-              sortMethod: 'directed',
-              levelSeparation: 230,
-              nodeSpacing: 110,
-              treeSpacing: 200,
-              blockShifting: true,
-              edgeMinimization: true,
-              parentCentralization: true,
-            },
-          },
-          physics: { enabled: false },
-          interaction: {
-            hover: true, dragNodes: true, zoomView: true,
-            navigationButtons: false, keyboard: false,
-          },
+      // ── Click-through ────────────────────────────────────────────────
+      root.querySelectorAll('.flow-card').forEach(el => {
+        el.addEventListener('click', () => {
+          // Datasets jump to Lineage Explorer; processes too (it'll show
+          // them in the graph). We also pre-fill Discover so the user has
+          // a stub query ready if they switch tabs.
+          if (el.dataset.kind === 'DataSet') {
+            Discover.prefill(`Tell me about the ${el.dataset.label} table`);
+          }
+          location.hash = '#/lineage';
+        });
+      });
+
+      // ── Compute SVG connectors AFTER cards have laid out ─────────────
+      const drawConnectors = () => {
+        const board = document.getElementById('flow-board');
+        const svg   = document.getElementById('flow-svg');
+        if (!board || !svg) return;
+        const boardRect = board.getBoundingClientRect();
+        svg.setAttribute('viewBox', `0 0 ${boardRect.width} ${boardRect.height}`);
+        svg.setAttribute('width', boardRect.width);
+        svg.setAttribute('height', boardRect.height);
+        svg.innerHTML = '';
+
+        // Marker for arrow heads
+        const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+        defs.innerHTML = `
+          <marker id="flow-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+                  markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto">
+            <path d="M 0 0 L 10 5 L 0 10 z" class="arrow-head"></path>
+          </marker>`;
+        svg.appendChild(defs);
+
+        const cardRect = (id) => {
+          const el = root.querySelector(`.flow-card[data-id="${cssEscape(id)}"]`);
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return {
+            x:  r.left  - boardRect.left,
+            y:  r.top   - boardRect.top,
+            w:  r.width,
+            h:  r.height,
+            cx: (r.left + r.right)  / 2 - boardRect.left,
+            cy: (r.top  + r.bottom) / 2 - boardRect.top,
+          };
+        };
+
+        for (const e of data.edges) {
+          if (e.label === 'DEPENDS_ON') continue; // hide noisy back-references
+          const a = cardRect(e.from);
+          const b = cardRect(e.to);
+          if (!a || !b) continue;
+
+          // Right edge of A → left edge of B, cubic bezier.
+          const x1 = a.x + a.w;
+          const y1 = a.cy;
+          const x2 = b.x;
+          const y2 = b.cy;
+          const dx = Math.max(36, (x2 - x1) / 2);
+          const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+          path.setAttribute('d', `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`);
+          path.setAttribute('marker-end', 'url(#flow-arrow)');
+          svg.appendChild(path);
         }
-      );
+      };
 
-      network.once('stabilizationIterationsDone', () => network.fit());
-
-      network.on('click', (params) => {
-        if (!params.nodes.length) return;
-        // Hop to the Lineage Explorer; the user gets the deeper drill-down there.
-        location.hash = '#/lineage';
-      });
-
-      document.getElementById('flow-fit').addEventListener('click', () => {
-        network.fit({ animation: { duration: 350, easingFunction: 'easeInOutQuad' } });
-      });
-      document.getElementById('flow-relayout').addEventListener('click', () => {
-        network.setOptions({ layout: { hierarchical: { enabled: true, direction: 'LR' } } });
-        network.fit();
-      });
+      // First paint after layout settles. Re-draw on resize.
+      requestAnimationFrame(drawConnectors);
+      const ro = new ResizeObserver(drawConnectors);
+      ro.observe(document.getElementById('flow-board'));
 
     } catch (e) { setError(e); }
   }
