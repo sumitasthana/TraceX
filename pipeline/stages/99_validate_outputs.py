@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from pipeline.config import (  # noqa: E402
     configure_logging,
     db_connect,
+    get_as_of_date,
     get_run_id,
     table_row_count,
 )
@@ -147,16 +148,24 @@ def _build_l1_checks(con) -> list[Callable[[], CheckResult]]:
 
 
 def _build_l2_checks(con) -> list[Callable[[], CheckResult]]:
-    rp_total = table_row_count(con, "fct_customer_risk_profile")
+    # All L2 checks scope to the current run's as_of_date partition. The fact
+    # table is now historised; counting / aggregating across every partition
+    # would silently break L2_DQ_03 (1-row-per-customer) on the second run.
+    aod = get_as_of_date().isoformat()
+    partition_clause = f"as_of_date = DATE '{aod}'"
+    rp_total = _scalar(
+        con,
+        f"SELECT COUNT(*) FROM fct_customer_risk_profile WHERE {partition_clause}",
+    )
     src_cust_total = table_row_count(con, "src_customer")
 
-    # ---- fct_customer_risk_profile ----------------------------------------
+    # ---- fct_customer_risk_profile (partition: as_of_date) -----------------
 
     def l2_dq_01_risk_score_range() -> CheckResult:
         bad = _scalar(
             con,
-            "SELECT COUNT(*) FROM fct_customer_risk_profile "
-            "WHERE risk_score < 0.0 OR risk_score > 1.0",
+            f"SELECT COUNT(*) FROM fct_customer_risk_profile "
+            f"WHERE {partition_clause} AND (risk_score < 0.0 OR risk_score > 1.0)",
         )
         return CheckResult(
             "L2_DQ_01", expected="risk_score in [0,1]", actual=f"{bad} rows out of range",
@@ -166,8 +175,9 @@ def _build_l2_checks(con) -> list[Callable[[], CheckResult]]:
     def l2_dq_02_no_nulls() -> CheckResult:
         bad = _scalar(
             con,
-            "SELECT COUNT(*) FROM fct_customer_risk_profile "
-            "WHERE risk_score IS NULL OR risk_tier IS NULL OR volume_percentile IS NULL",
+            f"SELECT COUNT(*) FROM fct_customer_risk_profile "
+            f"WHERE {partition_clause} AND "
+            f"(risk_score IS NULL OR risk_tier IS NULL OR volume_percentile IS NULL)",
         )
         return CheckResult(
             "L2_DQ_02",
@@ -188,7 +198,8 @@ def _build_l2_checks(con) -> list[Callable[[], CheckResult]]:
 
     def l2_dq_04_three_tiers() -> CheckResult:
         rows = con.execute(
-            "SELECT DISTINCT risk_tier FROM fct_customer_risk_profile ORDER BY 1"
+            f"SELECT DISTINCT risk_tier FROM fct_customer_risk_profile "
+            f"WHERE {partition_clause} ORDER BY 1"
         ).fetchall()
         tiers = sorted(r[0] for r in rows)
         expected = ["HIGH", "LOW", "MEDIUM"]
@@ -204,8 +215,8 @@ def _build_l2_checks(con) -> list[Callable[[], CheckResult]]:
     def l2_dq_05_volume_nonneg() -> CheckResult:
         bad = _scalar(
             con,
-            "SELECT COUNT(*) FROM fct_customer_risk_profile "
-            "WHERE total_txn_volume_usd_90d < 0",
+            f"SELECT COUNT(*) FROM fct_customer_risk_profile "
+            f"WHERE {partition_clause} AND total_txn_volume_usd_90d < 0",
         )
         return CheckResult(
             "L2_DQ_05",

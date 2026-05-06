@@ -1,13 +1,19 @@
-"""Stage 10 — produce fct_customer_risk_profile.
+"""Stage 10 — produce fct_customer_risk_profile (historised by as_of_date).
 
-One row per customer. Every transactional metric is anchored to MAX(txn_date) from
-stg_transaction_normalized so results are deterministic on static synthetic data.
-volume_percentile is computed in a second pass over the per-customer aggregation
-(PERCENT_RANK can only be applied after the rollup, never inside it).
+One row per (customer_id, as_of_date). Re-running for the same business date
+overwrites just that partition; running for a new date appends. The 90-day
+transactional metrics are anchored to LEAST(MAX(txn_date), as_of_date) so an
+earlier-date re-run can't leak future txns into the windows.
 
-Customers with zero transactions are preserved via LEFT JOIN; their ratios collapse
-to 0 because the LEFT-JOIN ghost row's NULL columns fall out of the FILTER clauses
-and we count txns via COUNT(ct.txn_id) (which is 0 when there is no match).
+`computed_at` stays as wall-clock CURRENT_TIMESTAMP — it is metadata describing
+when this row was produced, not a join key, and stripping it from the output
+would lose useful provenance. The two-key PK (customer_id, as_of_date) plus a
+DELETE-then-INSERT inside one connection means the table is byte-identical for
+the partition on re-runs.
+
+Customers with zero transactions are preserved via LEFT JOIN; their ratios
+collapse to 0 because the LEFT-JOIN ghost row's NULL columns fall out of the
+FILTER clauses and we count txns via COUNT(ct.txn_id).
 """
 from __future__ import annotations
 
@@ -21,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from pipeline.config import (  # noqa: E402
     configure_logging,
     db_connect,
+    get_as_of_date,
     get_run_id,
     table_row_count,
 )
@@ -37,10 +44,43 @@ SOURCE_TABLES = [
 ]
 DEPENDS_ON_STAGES = ["02_stg_transactions", "03_stg_customers"]
 
-TRANSFORM_SQL = f"""
-CREATE OR REPLACE TABLE {OUTPUT_TABLE} AS
+# DDL is idempotent; a fresh DB starts with this shape, an existing DB
+# has it added on first run after the migration. Schema is identical to
+# the historic CREATE OR REPLACE output PLUS an `as_of_date` partition key.
+CREATE_TABLE_SQL = f"""
+CREATE TABLE IF NOT EXISTS {OUTPUT_TABLE} (
+    customer_id              VARCHAR NOT NULL,
+    as_of_date               DATE    NOT NULL,
+    full_name                VARCHAR,
+    age                      INTEGER,
+    is_us_person             BOOLEAN,
+    kyc_status               VARCHAR,
+    kyc_stale_flag           BOOLEAN,
+    branch_region            VARCHAR,
+    total_txn_volume_usd_90d DOUBLE,
+    txn_count_90d            BIGINT,
+    international_txn_ratio  DOUBLE,
+    avg_txn_amount_usd       DOUBLE,
+    reversal_rate            DOUBLE,
+    volume_percentile        DOUBLE,
+    risk_score               DOUBLE,
+    risk_tier                VARCHAR,
+    reference_date           DATE,
+    computed_at              TIMESTAMP,
+    CONSTRAINT pk_fct_risk PRIMARY KEY (customer_id, as_of_date)
+)
+"""
+
+
+def build_transform_sql(as_of_date) -> str:
+    """SELECT body for the partition INSERT. `reference_date` is clamped to
+    `as_of_date` so the 90-day window is stable across re-runs of any prior
+    date — no temporal leak when back-filling."""
+    aod = as_of_date.isoformat()
+    return f"""
 WITH ref AS (
-    SELECT MAX(txn_date) AS reference_date FROM stg_transaction_normalized
+    SELECT LEAST(MAX(txn_date), DATE '{aod}') AS reference_date
+    FROM stg_transaction_normalized
 ),
 customer_txns AS (
     SELECT
@@ -117,6 +157,7 @@ scored AS (
 )
 SELECT
     customer_id,
+    DATE '{aod}' AS as_of_date,
     full_name,
     age,
     is_us_person,
@@ -140,17 +181,6 @@ SELECT
 FROM scored
 """
 
-TIER_DISTRIBUTION_SQL = f"""
-SELECT
-    SUM(CASE WHEN risk_tier = 'HIGH'   THEN 1 ELSE 0 END) AS high_n,
-    SUM(CASE WHEN risk_tier = 'MEDIUM' THEN 1 ELSE 0 END) AS medium_n,
-    SUM(CASE WHEN risk_tier = 'LOW'    THEN 1 ELSE 0 END) AS low_n,
-    COUNT(*)                                              AS total_n
-FROM {OUTPUT_TABLE}
-"""
-
-REF_DATE_SQL = f"SELECT MIN(reference_date) FROM {OUTPUT_TABLE}"
-
 HIGH_RISK_THRESHOLD = 0.30  # warn if > 30% of customers land in HIGH
 
 
@@ -158,6 +188,13 @@ def main() -> int:
     run_id = get_run_id()
     log = configure_logging(run_id, STAGE_NAME)
     started = time.perf_counter()
+    as_of_date = get_as_of_date()
+    aod = as_of_date.isoformat()
+    transform_sql = build_transform_sql(as_of_date)
+
+    # Wrapper that gives the lineage parser a CREATE OR REPLACE TABLE shape
+    # to parse, even though we actually execute as DELETE + INSERT below.
+    lineage_sql = f"CREATE OR REPLACE TABLE {OUTPUT_TABLE} AS {transform_sql}"
 
     try:
         with db_connect() as con:
@@ -171,17 +208,29 @@ def main() -> int:
                 stg_customer_enriched_rows=cust_rows,
                 src_account_rows=acct_rows,
                 output_table=OUTPUT_TABLE,
+                as_of_date_resolved=aod,
             )
 
-            log.info("transform_start", sql=TRANSFORM_SQL.strip())
+            # Ensure the historised table exists with the right shape.
+            con.execute(CREATE_TABLE_SQL)
+
+            log.info("transform_start", sql=transform_sql.strip())
             t0 = time.perf_counter()
-            con.execute(TRANSFORM_SQL)
-            output_rows = table_row_count(con, OUTPUT_TABLE)
+            # Partition overwrite: delete this as_of_date's slice, then
+            # re-INSERT it. Other partitions are left intact.
+            con.execute(
+                f"DELETE FROM {OUTPUT_TABLE} WHERE as_of_date = DATE '{aod}'"
+            )
+            con.execute(f"INSERT INTO {OUTPUT_TABLE} {transform_sql}")
+            output_rows = int(con.execute(
+                f"SELECT COUNT(*) FROM {OUTPUT_TABLE} WHERE as_of_date = DATE '{aod}'"
+            ).fetchone()[0])
             transform_ms = int((time.perf_counter() - t0) * 1000)
             log.info(
                 "transform_complete",
                 output_row_count=output_rows,
                 duration_ms=transform_ms,
+                partition_as_of_date=aod,
             )
 
             try:
@@ -189,7 +238,7 @@ def main() -> int:
                 build_and_ingest(
                     stage=STAGE_NAME,
                     run_id=run_id,
-                    sql=TRANSFORM_SQL,
+                    sql=lineage_sql,
                     target_table=OUTPUT_TABLE,
                     source_tables=SOURCE_TABLES,
                     depends_on_stages=DEPENDS_ON_STAGES,
@@ -206,10 +255,22 @@ def main() -> int:
                     error_type=type(exc).__name__,
                 )
 
-            (ref_date,) = con.execute(REF_DATE_SQL).fetchone()
-            log.info("reference_date_resolved", reference_date=str(ref_date))
+            (ref_date,) = con.execute(
+                f"SELECT MIN(reference_date) FROM {OUTPUT_TABLE} WHERE as_of_date = DATE '{aod}'"
+            ).fetchone()
+            log.info("reference_date_resolved", reference_date=str(ref_date), as_of_date=aod)
 
-            high_n, medium_n, low_n, total_n = con.execute(TIER_DISTRIBUTION_SQL).fetchone()
+            high_n, medium_n, low_n, total_n = con.execute(
+                f"""
+                SELECT
+                    SUM(CASE WHEN risk_tier = 'HIGH'   THEN 1 ELSE 0 END) AS high_n,
+                    SUM(CASE WHEN risk_tier = 'MEDIUM' THEN 1 ELSE 0 END) AS medium_n,
+                    SUM(CASE WHEN risk_tier = 'LOW'    THEN 1 ELSE 0 END) AS low_n,
+                    COUNT(*)                                              AS total_n
+                FROM {OUTPUT_TABLE}
+                WHERE as_of_date = DATE '{aod}'
+                """,
+            ).fetchone()
             high_n = int(high_n or 0)
             medium_n = int(medium_n or 0)
             low_n = int(low_n or 0)

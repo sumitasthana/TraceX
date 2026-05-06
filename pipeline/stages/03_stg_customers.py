@@ -4,6 +4,11 @@ Adds derived customer attributes (full_name, age, is_us_person, KYC freshness) a
 joins src_branch.region for downstream segmentation. We log a KYC-stale warning if
 more than 20% of the population has stale or expired KYC — that threshold mirrors
 how compliance teams typically wake up to a remediation backlog.
+
+Determinism: `age` and `kyc_days_since_review` are anchored to the pipeline's
+`as_of_date` (not wall-clock CURRENT_DATE) so re-running for the same business date
+produces byte-identical rows. The TRANSFORM_SQL constant is built lazily from the
+date so the cached `sql_hash` keys cleanly into the catalog.
 """
 from __future__ import annotations
 
@@ -17,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from pipeline.config import (  # noqa: E402
     configure_logging,
     db_connect,
+    get_as_of_date,
     get_run_id,
     table_row_count,
 )
@@ -28,7 +34,12 @@ OUTPUT_TABLE = "stg_customer_enriched"
 
 KYC_STALE_WARN_THRESHOLD = 0.20  # 20%
 
-TRANSFORM_SQL = f"""
+
+def build_transform_sql(as_of_date) -> str:
+    """SQL is parameterised on `as_of_date` so the same business date produces
+    identical output regardless of when the run executes."""
+    aod = as_of_date.isoformat()
+    return f"""
 CREATE OR REPLACE TABLE {OUTPUT_TABLE} AS
 SELECT
     c.customer_id,
@@ -37,15 +48,15 @@ SELECT
     c.onboarded_date,
     c.branch_id,
     c.first_name || ' ' || c.last_name                    AS full_name,
-    CAST(EXTRACT(YEAR FROM AGE(CURRENT_DATE, c.dob)) AS INTEGER) AS age,
+    CAST(EXTRACT(YEAR FROM AGE(DATE '{aod}', c.dob)) AS INTEGER) AS age,
     (c.citizenship = 'US' OR c.country_of_birth = 'US')   AS is_us_person,
     CASE
         WHEN c.kyc_reviewed_at IS NULL THEN NULL
-        ELSE DATE_DIFF('day', CAST(c.kyc_reviewed_at AS DATE), CURRENT_DATE)
+        ELSE DATE_DIFF('day', CAST(c.kyc_reviewed_at AS DATE), DATE '{aod}')
     END                                                   AS kyc_days_since_review,
     (
         (c.kyc_reviewed_at IS NOT NULL
-            AND DATE_DIFF('day', CAST(c.kyc_reviewed_at AS DATE), CURRENT_DATE) > 365)
+            AND DATE_DIFF('day', CAST(c.kyc_reviewed_at AS DATE), DATE '{aod}') > 365)
         OR c.kyc_status = 'EXPIRED'
     )                                                     AS kyc_stale_flag,
     b.region                                              AS branch_region
@@ -76,6 +87,8 @@ def main() -> int:
     run_id = get_run_id()
     log = configure_logging(run_id, STAGE_NAME)
     started = time.perf_counter()
+    as_of_date = get_as_of_date()
+    transform_sql = build_transform_sql(as_of_date)
 
     try:
         with db_connect() as con:
@@ -88,11 +101,12 @@ def main() -> int:
                 branch_table=BRANCH_TABLE,
                 branch_row_count=branch_rows,
                 output_table=OUTPUT_TABLE,
+                as_of_date_resolved=as_of_date.isoformat(),
             )
 
-            log.info("transform_start", sql=TRANSFORM_SQL.strip())
+            log.info("transform_start", sql=transform_sql.strip())
             t0 = time.perf_counter()
-            con.execute(TRANSFORM_SQL)
+            con.execute(transform_sql)
             output_rows = table_row_count(con, OUTPUT_TABLE)
             transform_ms = int((time.perf_counter() - t0) * 1000)
             log.info(
@@ -106,7 +120,7 @@ def main() -> int:
                 build_and_ingest(
                     stage=STAGE_NAME,
                     run_id=run_id,
-                    sql=TRANSFORM_SQL,
+                    sql=transform_sql,
                     target_table=OUTPUT_TABLE,
                     source_tables=["src_customer", "src_branch"],
                     depends_on_stages=[],
