@@ -144,30 +144,46 @@ def _validate_manifest(
     return True, manifest, ""
 
 
-def _ingest_one(
+# FK-safe ordering of src_* tables. Forward order = parents first
+# (use for INSERTs / CREATEs); reverse for DELETEs to avoid violating
+# foreign-key constraints between src_account → src_customer →
+# src_branch and src_transaction → src_account.
+SRC_DEPENDENCY_ORDER = [
+    "src_branch",
+    "src_customer",
+    "src_account",
+    "src_transaction",
+    "src_fx_rate",
+]
+
+
+def _load_raw(
     con,
     sor: str,
     entity: str,
-    src_table: str,
     partition_dir: Path,
     manifest: dict,
     log,
-) -> tuple[int, str]:
-    """Validate row count, then atomically rebuild raw_* and src_*. Returns
-    (rows_loaded, sha256)."""
+) -> int:
+    """Phase 2a: load `raw_{sor}_{entity}` from parquet and validate row
+    count. Raw tables have no constraints, so CREATE OR REPLACE is safe."""
     parquet_path = partition_dir / "data.parquet"
     raw_table = f"raw_{sor}_{entity}"
 
-    # Load via DuckDB's read_parquet — preserves column order and types.
+    # `hive_partitioning=false` keeps `business_date` from being injected
+    # as a synthetic 14th column inferred from the partition path. The
+    # source-of-record column count must stay 1:1 with what was COPY'd
+    # out of the live src_* table, otherwise the INSERT INTO src_*
+    # below blows up with a Binder column-mismatch.
     con.execute(
         f"CREATE OR REPLACE TABLE {raw_table} AS "
-        f"SELECT * FROM read_parquet('{parquet_path.as_posix()}')"
+        f"SELECT * FROM read_parquet("
+        f"'{parquet_path.as_posix()}', hive_partitioning=false)"
     )
     actual_rows = int(con.execute(f"SELECT COUNT(*) FROM {raw_table}").fetchone()[0])
 
     expected = int(manifest.get("row_count", -1))
     if actual_rows != expected:
-        # Roll back: drop the raw_ table so partial state isn't visible.
         con.execute(f"DROP TABLE IF EXISTS {raw_table}")
         raise ValueError(
             f"row_count mismatch for {raw_table}: parquet has {actual_rows}, "
@@ -179,19 +195,66 @@ def _ingest_one(
         sor=sor, entity=entity, raw_table=raw_table,
         rows=actual_rows, sha256_prefix=manifest["sha256"][:12],
     )
+    return actual_rows
 
-    # Promote to src_*: identical column order/types because we COPY ... TO
-    # parquet preserves them.
-    con.execute(
-        f"CREATE OR REPLACE TABLE {src_table} AS SELECT * FROM {raw_table}"
-    )
-    log.info(
-        "src_promoted",
-        sor=sor, entity=entity,
-        src_table=src_table, raw_table=raw_table,
-        rows=actual_rows,
-    )
-    return actual_rows, manifest["sha256"]
+
+def _promote_to_src(con, validations: list, log) -> dict[str, int]:
+    """Phase 2b/c: refill `src_*` tables from `raw_*` in FK-safe order.
+
+    `CREATE OR REPLACE` doesn't work because src_account → src_customer
+    and src_transaction → src_account are FK-linked; dropping a parent
+    is rejected while children exist. Instead:
+
+      - DELETE rows in REVERSE dependency order (children first).
+      - Then INSERT rows in FORWARD dependency order (parents first),
+        creating the table on its first encounter.
+
+    This preserves the original FK constraints from layer0/load_duckdb.py
+    on the second-and-onward run.
+    """
+    by_src: dict[str, dict] = {}
+    for sor, entity, src_table, _partition_dir, manifest in validations:
+        by_src[src_table] = {
+            "sor": sor, "entity": entity, "manifest": manifest,
+            "raw_table": f"raw_{sor}_{entity}",
+        }
+
+    # DELETE in reverse dependency order.
+    for src_table in reversed(SRC_DEPENDENCY_ORDER):
+        if src_table not in by_src:
+            continue
+        try:
+            con.execute(f"DELETE FROM {src_table}")
+        except Exception:
+            # Table doesn't exist yet — that's fine, INSERT below will
+            # create it.
+            pass
+
+    # INSERT (or CREATE) in forward dependency order.
+    rows_per_entity: dict[str, int] = {}
+    for src_table in SRC_DEPENDENCY_ORDER:
+        if src_table not in by_src:
+            continue
+        info = by_src[src_table]
+        raw_table = info["raw_table"]
+        exists = con.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
+            [src_table],
+        ).fetchone()
+        if exists:
+            con.execute(f"INSERT INTO {src_table} SELECT * FROM {raw_table}")
+        else:
+            con.execute(f"CREATE TABLE {src_table} AS SELECT * FROM {raw_table}")
+
+        rows = int(con.execute(f"SELECT COUNT(*) FROM {src_table}").fetchone()[0])
+        rows_per_entity[src_table] = rows
+        log.info(
+            "src_promoted",
+            sor=info["sor"], entity=info["entity"],
+            src_table=src_table, raw_table=raw_table,
+            rows=rows,
+        )
+    return rows_per_entity
 
 
 def main() -> int:
@@ -269,23 +332,32 @@ def main() -> int:
         return 1
 
     # ── Phase 2: promote — every manifest passed, mutations are safe ──
+    # Done in three sub-phases so FK constraints between src_* tables are
+    # not violated:
+    #   2a) Load every raw_{sor}_{entity} from parquet (no constraints).
+    #   2b) DELETE rows from src_* in reverse dependency order.
+    #   2c) INSERT (or CREATE on first run) into src_* in forward order.
     rows_per_entity: dict[str, int] = {}
     try:
         with db_connect() as con:
-            for sor, entity, src_table, partition_dir, manifest in validations:
-                rows, _sha = _ingest_one(con, sor, entity, src_table,
-                                         partition_dir, manifest, log)
-                rows_per_entity[src_table] = rows
+            # Phase 2a — raw load + row-count validation.
+            for sor, entity, _src_table, partition_dir, manifest in validations:
+                _load_raw(con, sor, entity, partition_dir, manifest, log)
 
-                # Lineage: each src_* is now produced by an INGEST process. No
-                # source_tables (it's an external file) and no upstream stages.
+            # Phase 2b/c — FK-safe promote.
+            rows_per_entity = _promote_to_src(con, validations, log)
+
+            # Lineage: each src_* is now produced by an INGEST process. Done
+            # AFTER the promote so the row counts in the manifest are real.
+            for sor, entity, src_table, partition_dir, manifest in validations:
+                rows = rows_per_entity.get(src_table, 0)
                 try:
                     from lineage.manifest_builder import build_and_ingest  # noqa: WPS433
                     sql = (
                         f"-- ingest from landing/{sor}/{entity}/business_date={aod}\n"
-                        f"CREATE OR REPLACE TABLE {src_table} AS "
-                        f"SELECT * FROM read_parquet("
-                        f"'{(partition_dir / 'data.parquet').as_posix()}')"
+                        f"INSERT INTO {src_table} SELECT * FROM "
+                        f"read_parquet('{(partition_dir / 'data.parquet').as_posix()}', "
+                        f"hive_partitioning=false)"
                     )
                     build_and_ingest(
                         stage=STAGE_NAME,
