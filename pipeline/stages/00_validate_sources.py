@@ -1,4 +1,16 @@
-"""Stage 00 — fail-fast precondition check on Layer 0 source tables."""
+"""Stage 00 — verify ingestion produced the Layer 0 tables this pipeline expects.
+
+Up to and including stage `_1_ingest_landing`, the canonical workflow is:
+
+    landing/<sor>/<entity>/business_date=<as_of_date>/{data.parquet, _manifest.json}
+        ↓ (validated + promoted by _1_ingest_landing.py)
+    src_<entity>            ← what THIS stage asserts exists and is non-empty
+
+So `00_validate_sources` is no longer "verify a human loaded these tables" —
+it's "verify ingestion produced what we expected, before any staging stage
+touches them." The `EXPECTED_SOURCES` list is still the contract that the
+ingestion stage must honour; if that list grows, both files change together.
+"""
 from __future__ import annotations
 
 import sys

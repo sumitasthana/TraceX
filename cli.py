@@ -62,9 +62,17 @@ def cmd_load(_args: argparse.Namespace) -> int:
     return _run([PYTHON, str(REPO_ROOT / "layer0" / "load_duckdb.py")])
 
 
-def cmd_pipeline(_args: argparse.Namespace) -> int:
+def cmd_pipeline(args: argparse.Namespace) -> int:
     _banner("Pipeline — run all stages")
-    return _run([PYTHON, str(REPO_ROOT / "pipeline" / "run_pipeline.py")])
+    cmd = [PYTHON, str(REPO_ROOT / "pipeline" / "run_pipeline.py")]
+    if getattr(args, "as_of_date", None):
+        cmd += ["--as-of-date", args.as_of_date]
+    return _run(cmd)
+
+
+def cmd_bootstrap_landing(_args: argparse.Namespace) -> int:
+    _banner("Landing — bootstrap parquet partitions from existing src_* tables")
+    return _run([PYTHON, str(REPO_ROOT / "scripts" / "bootstrap_landing.py")])
 
 
 def cmd_ingest(args: argparse.Namespace) -> int:
@@ -99,6 +107,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
 def cmd_up(args: argparse.Namespace) -> int:
     """Bootstrap everything, then serve. Skips steps whose outputs already exist
     unless --force is passed."""
+    if not getattr(args, "as_of_date", None):
+        print(
+            "[tracex] `up` now requires --as-of-date YYYY-MM-DD "
+            "(the pipeline is date-anchored). See pipeline/README.md.",
+            file=sys.stderr,
+        )
+        return 2
+
     if args.force or not any(CSV_DIR.glob("*.csv")):
         _run_or_exit([PYTHON, str(REPO_ROOT / "layer0" / "generate.py")], "generate")
     else:
@@ -109,7 +125,11 @@ def cmd_up(args: argparse.Namespace) -> int:
     else:
         print(f"[tracex] skipping load — {DUCKDB_PATH.name} already exists")
 
-    _run_or_exit([PYTHON, str(REPO_ROOT / "pipeline" / "run_pipeline.py")], "pipeline")
+    _run_or_exit(
+        [PYTHON, str(REPO_ROOT / "pipeline" / "run_pipeline.py"),
+         "--as-of-date", args.as_of_date],
+        "pipeline",
+    )
     _run_or_exit(
         [PYTHON, str(REPO_ROOT / "lineage" / "ingest.py"), "--latest"],
         "ingest",
@@ -236,7 +256,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("generate", help="generate Layer 0 synthetic CSVs").set_defaults(func=cmd_generate)
     sub.add_parser("load",     help="load CSVs into DuckDB").set_defaults(func=cmd_load)
-    sub.add_parser("pipeline", help="run staging + facts pipeline").set_defaults(func=cmd_pipeline)
+    sub.add_parser("bootstrap-landing",
+                   help="migrate existing src_* tables into landing/ tree (one-shot)"
+                   ).set_defaults(func=cmd_bootstrap_landing)
+    pipe_p = sub.add_parser("pipeline", help="run staging + facts pipeline (date-anchored)")
+    pipe_p.add_argument("--as-of-date", required=True,
+                        help="business date (YYYY-MM-DD)")
+    pipe_p.set_defaults(func=cmd_pipeline)
 
     ingest_p = sub.add_parser("ingest", help="ingest pipeline JSONL into the lineage graph")
     grp = ingest_p.add_mutually_exclusive_group()
@@ -255,6 +281,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     up_p = sub.add_parser("up", help="full bootstrap then serve (skips steps whose outputs exist)")
     up_p.add_argument("--force", action="store_true", help="re-run generate + load even if outputs exist")
+    up_p.add_argument("--as-of-date", required=True, help="business date for the pipeline run (YYYY-MM-DD)")
     up_p.add_argument("--host", default=os.environ.get("TRACEX_UI_HOST", "127.0.0.1"))
     up_p.add_argument("--port", type=int, default=int(os.environ.get("TRACEX_UI_PORT", "8765")))
     up_p.set_defaults(func=cmd_up)
