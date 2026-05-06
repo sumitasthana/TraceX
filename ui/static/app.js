@@ -1200,22 +1200,86 @@ const App = (() => {
             <span><span class="swatch l1"></span>L1 staging</span>
             <span><span class="swatch l2"></span>L2 fact / gold</span>
             <span><span class="swatch proc"></span>process</span>
-            <span style="margin-left:auto;color:#64748b">Click any card to open it in the Lineage Explorer.</span>
+            <span style="margin-left:auto;color:#64748b">Click any card to highlight its full upstream + downstream path. Click again or click empty space to clear.</span>
           </div>
         </div>`;
 
-      // ── Click-through ────────────────────────────────────────────────
-      root.querySelectorAll('.flow-card').forEach(el => {
-        el.addEventListener('click', () => {
-          // Datasets jump to Lineage Explorer; processes too (it'll show
-          // them in the graph). We also pre-fill Discover so the user has
-          // a stub query ready if they switch tabs.
-          if (el.dataset.kind === 'DataSet') {
-            Discover.prefill(`Tell me about the ${el.dataset.label} table`);
+      // ── Click-to-trace: highlight the full path through any clicked card ──
+      // Build adjacency maps once. DEPENDS_ON edges are noise here so we
+      // skip them, mirroring what drawConnectors does.
+      const adjUp = new Map();   // id → set of upstream ids
+      const adjDn = new Map();   // id → set of downstream ids
+      for (const e of data.edges) {
+        if (e.label === 'DEPENDS_ON') continue;
+        if (!adjDn.has(e.from)) adjDn.set(e.from, new Set());
+        if (!adjUp.has(e.to))   adjUp.set(e.to,   new Set());
+        adjDn.get(e.from).add(e.to);
+        adjUp.get(e.to).add(e.from);
+      }
+      function walk(adj, start) {
+        const seen = new Set();
+        const queue = [start];
+        while (queue.length) {
+          const cur = queue.shift();
+          for (const nxt of (adj.get(cur) || [])) {
+            if (seen.has(nxt)) continue;
+            seen.add(nxt);
+            queue.push(nxt);
           }
-          location.hash = '#/lineage';
+        }
+        return seen;
+      }
+
+      const board = document.getElementById('flow-board');
+      let currentTraceRoot = null;   // persists across redraws (resize, etc.)
+
+      function clearTrace() {
+        currentTraceRoot = null;
+        if (!board) return;
+        board.classList.remove('has-selection');
+        board.querySelectorAll('.flow-card').forEach(c => {
+          c.classList.remove('on-path', 'is-root');
+        });
+        board.querySelectorAll('.flow-svg path').forEach(p => {
+          p.classList.remove('on-path');
+        });
+      }
+
+      function tracePath(rootId) {
+        if (!board) return;
+        currentTraceRoot = rootId;
+        const onPath = new Set([rootId, ...walk(adjUp, rootId), ...walk(adjDn, rootId)]);
+        board.classList.add('has-selection');
+        board.querySelectorAll('.flow-card').forEach(c => {
+          const id = c.dataset.id;
+          c.classList.toggle('on-path', onPath.has(id));
+          c.classList.toggle('is-root', id === rootId);
+        });
+        board.querySelectorAll('.flow-svg path').forEach(p => {
+          const f = p.getAttribute('data-from');
+          const t = p.getAttribute('data-to');
+          p.classList.toggle('on-path', onPath.has(f) && onPath.has(t));
+        });
+      }
+
+      // Expose for the redraw hook so it can re-apply on resize.
+      window.__flowReapplyTrace = () => {
+        if (currentTraceRoot) tracePath(currentTraceRoot);
+      };
+
+      root.querySelectorAll('.flow-card').forEach(el => {
+        el.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          if (el.classList.contains('is-root')) {
+            clearTrace();
+            return;
+          }
+          tracePath(el.dataset.id);
         });
       });
+
+      // Click anywhere on the board background → clear.
+      board.addEventListener('click', () => clearTrace());
 
       // ── Compute SVG connectors AFTER cards have laid out ─────────────
       const drawConnectors = () => {
@@ -1266,13 +1330,20 @@ const App = (() => {
           const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
           path.setAttribute('d', `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`);
           path.setAttribute('marker-end', 'url(#flow-arrow)');
+          path.setAttribute('data-from', e.from);
+          path.setAttribute('data-to', e.to);
           svg.appendChild(path);
         }
       };
 
-      // First paint after layout settles. Re-draw on resize.
-      requestAnimationFrame(drawConnectors);
-      const ro = new ResizeObserver(drawConnectors);
+      // First paint after layout settles. Re-draw on resize and re-apply
+      // the active trace (if any) so it survives redraws.
+      const drawAndReapply = () => {
+        drawConnectors();
+        if (window.__flowReapplyTrace) window.__flowReapplyTrace();
+      };
+      requestAnimationFrame(drawAndReapply);
+      const ro = new ResizeObserver(drawAndReapply);
       ro.observe(document.getElementById('flow-board'));
 
     } catch (e) { setError(e); }

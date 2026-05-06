@@ -474,6 +474,35 @@ body { -webkit-font-smoothing: antialiased; }
   color: #ddd6fe;
 }
 
+/* ── Click-to-trace highlight states ─────────────────────────── */
+.flow-card        { transition: transform .15s, opacity .25s, border-color .15s, background .15s, box-shadow .25s; }
+.flow-svg path    { transition: opacity .25s, stroke .25s, stroke-width .25s; }
+
+.flow-board.has-selection .flow-card  { opacity: .18; }
+.flow-board.has-selection .flow-svg path { opacity: .08; }
+
+.flow-board.has-selection .flow-card.on-path {
+  opacity: 1;
+  border-color: rgba(96,165,250,.55);
+  box-shadow: 0 0 0 1px rgba(96,165,250,.30), 0 4px 14px rgba(96,165,250,.16);
+}
+.flow-board.has-selection .flow-card.is-root {
+  opacity: 1;
+  border-color: #60a5fa;
+  background: rgba(96,165,250,.10);
+  box-shadow: 0 0 0 2px rgba(96,165,250,.85), 0 8px 22px rgba(96,165,250,.30);
+}
+.flow-board.has-selection .flow-svg path.on-path {
+  opacity: 1;
+  stroke: #93c5fd;
+  stroke-width: 2;
+  filter: drop-shadow(0 0 6px rgba(96,165,250,.45));
+}
+.flow-board.has-selection .flow-svg path.on-path + .arrow-head,
+.flow-board.has-selection .flow-svg .arrow-head.on-path {
+  fill: #93c5fd;
+}
+
 /* ── Inline legend below the board ───────────────────────────── */
 .flow-legend {
   display: flex;
