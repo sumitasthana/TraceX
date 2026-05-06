@@ -1083,6 +1083,151 @@ const App = (() => {
     } catch (e) { setError(e); }
   }
 
+  // ---------- Pipeline Flow view ---------------------------------------
+  // Aligned, layered LR pipeline diagram: source CSVs → 0→1 processes →
+  // staging tables → 1→2 process → fact tables. One process per stage
+  // (runs are deduped) so the picture stays clean as the pipeline accrues
+  // historical runs in Kuzu.
+
+  async function viewFlow() {
+    setLoading();
+    try {
+      const data = await api('/api/lineage/graph');
+
+      // Dedupe Process nodes by stage label so the diagram doesn't fan out
+      // by run_id. Keep the latest run_id per stage (Kuzu doesn't give us
+      // computed_at on the graph endpoint, so "latest" = the last one
+      // encountered, which is good enough for a snapshot view).
+      const procByStage = new Map();
+      data.nodes.forEach(n => {
+        if (n.group === 'Process') procByStage.set(n.label, n);
+      });
+      const keptProcIds = new Set(Array.from(procByStage.values()).map(n => n.id));
+
+      const filteredNodes = data.nodes.filter(n =>
+        n.group !== 'Process' || keptProcIds.has(n.id)
+      );
+      const filteredEdges = data.edges.filter(e => {
+        if (e.from.startsWith('proc::') && !keptProcIds.has(e.from)) return false;
+        if (e.to.startsWith('proc::')   && !keptProcIds.has(e.to))   return false;
+        return true;
+      });
+
+      const visNodes = new vis.DataSet(filteredNodes.map(n => {
+        if (n.group === 'DataSet') {
+          return {
+            id: n.id,
+            label: n.label,
+            shape: 'box',
+            color: { background: n.color, border: n.color,
+                     highlight: { background: n.color, border: '#0c1f3d' } },
+            font: { color: '#fff', face: 'DM Sans', size: 13 },
+            margin: 12,
+            widthConstraint: { minimum: 150, maximum: 220 },
+            shapeProperties: { borderRadius: 6 },
+            nodeKind: 'DataSet',
+            layer: n.layer,
+          };
+        }
+        return {
+          id: n.id,
+          label: n.label,
+          shape: 'ellipse',
+          color: { background: '#fff', border: '#0c1f3d',
+                   highlight: { background: '#e8eef7', border: '#0c1f3d' } },
+          font: { color: '#0c1f3d', face: 'DM Mono', size: 11 },
+          borderWidth: 2,
+          margin: 10,
+          widthConstraint: { minimum: 130, maximum: 220 },
+          nodeKind: 'Process',
+        };
+      }));
+
+      const visEdges = new vis.DataSet(filteredEdges.map((e, i) => ({
+        id: `flow::${i}`,
+        from: e.from, to: e.to,
+        arrows: { to: { enabled: true, scaleFactor: 0.7 } },
+        color: { color: '#94a3b8', opacity: 0.75 },
+        width: 1.4,
+        smooth: { type: 'cubicBezier', forceDirection: 'horizontal', roundness: 0.45 },
+      })));
+
+      const swimlanes = `
+        <div class="flow-swimlanes">
+          <div class="flow-band" style="background:rgba(15,118,110,.10);color:#0f766e">L0 — raw sources</div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-band" style="background:rgba(12,31,61,.06);color:#0c1f3d">0 → 1 transforms</div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-band" style="background:rgba(29,78,216,.10);color:#1d4ed8">L1 — staging</div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-band" style="background:rgba(12,31,61,.06);color:#0c1f3d">1 → 2 transform</div>
+          <div class="flow-arrow">→</div>
+          <div class="flow-band" style="background:rgba(109,40,217,.10);color:#6d28d9">L2 — facts (gold)</div>
+        </div>`;
+
+      root.innerHTML = pageHeader(
+        'Pipeline Flow',
+        `${filteredNodes.filter(n => n.group === 'DataSet').length} datasets and ${procByStage.size} stages, snapshotted left-to-right`,
+        ''
+      ) + `
+        <div class="card animate-fadein">
+          ${swimlanes}
+          <div class="card p-2 relative" style="border:none;box-shadow:none">
+            <div class="absolute top-3 right-3 z-10 flex gap-1">
+              <button id="flow-fit"       type="button" class="btn-secondary text-[10px] px-2 py-1">Fit</button>
+              <button id="flow-relayout"  type="button" class="btn-secondary text-[10px] px-2 py-1">Re-layout</button>
+            </div>
+            <div id="flow-canvas" style="height:600px; background:#fafbfd; border-radius:8px;"></div>
+          </div>
+          <div class="px-4 py-2 text-[11px] text-g-500" style="border-top:1px solid var(--g-100)">
+            Click any node to open it in the Lineage Explorer for column-level drill-down.
+          </div>
+        </div>`;
+
+      const network = new vis.Network(
+        document.getElementById('flow-canvas'),
+        { nodes: visNodes, edges: visEdges },
+        {
+          layout: {
+            hierarchical: {
+              enabled: true,
+              direction: 'LR',
+              sortMethod: 'directed',
+              levelSeparation: 230,
+              nodeSpacing: 110,
+              treeSpacing: 200,
+              blockShifting: true,
+              edgeMinimization: true,
+              parentCentralization: true,
+            },
+          },
+          physics: { enabled: false },
+          interaction: {
+            hover: true, dragNodes: true, zoomView: true,
+            navigationButtons: false, keyboard: false,
+          },
+        }
+      );
+
+      network.once('stabilizationIterationsDone', () => network.fit());
+
+      network.on('click', (params) => {
+        if (!params.nodes.length) return;
+        // Hop to the Lineage Explorer; the user gets the deeper drill-down there.
+        location.hash = '#/lineage';
+      });
+
+      document.getElementById('flow-fit').addEventListener('click', () => {
+        network.fit({ animation: { duration: 350, easingFunction: 'easeInOutQuad' } });
+      });
+      document.getElementById('flow-relayout').addEventListener('click', () => {
+        network.setOptions({ layout: { hierarchical: { enabled: true, direction: 'LR' } } });
+        network.fit();
+      });
+
+    } catch (e) { setError(e); }
+  }
+
   // ---------- router ---------------------------------------------------
 
   const routes = [
@@ -1090,6 +1235,7 @@ const App = (() => {
     { match: /^#\/runs$/,                           view: () => viewRuns(),                          nav: 'runs' },
     { match: /^#\/runs\/(.+)$/,                     view: (m) => viewRunDetail(decodeURIComponent(m[1])), nav: 'runs' },
     { match: /^#\/lineage$/,                        view: () => viewLineage(),                       nav: 'lineage' },
+    { match: /^#\/flow$/,                           view: () => viewFlow(),                          nav: 'flow' },
     { match: /^#\/datasets$/,                       view: () => viewDatasets(),                      nav: 'datasets' },
     { match: /^#\/catalog$/,                        view: () => viewCatalog(),                       nav: 'catalog' },
     { match: /^#\/dq$/,                             view: () => viewDQ(),                            nav: 'dq' },

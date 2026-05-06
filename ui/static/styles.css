@@ -260,6 +260,39 @@ body { -webkit-font-smoothing: antialiased; }
   border-radius: 4px;
 }
 
+/* ── Pipeline Flow ──────────────────────────────────────────── */
+.flow-swimlanes {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--g-100);
+  font-family: 'DM Mono', 'JetBrains Mono', monospace;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.flow-band {
+  flex: 1;
+  text-align: center;
+  padding: 7px 10px;
+  border-radius: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.flow-arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--g-300);
+  width: 18px;
+  flex-shrink: 0;
+}
+
 /* ── Sidebar live-dot ───────────────────────────────────────── */
 .nav-dot-green {
   display: inline-block;
