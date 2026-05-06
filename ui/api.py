@@ -1055,6 +1055,46 @@ class _NoCacheStaticFiles(StaticFiles):
 app.mount("/static", _NoCacheStaticFiles(directory=str(UI_ROOT / "static")), name="static")
 
 
+@app.get("/api/lineage/process_doc/{stage_name}")
+def lineage_process_doc(stage_name: str):
+    """Return the module docstring of `pipeline/stages/{stage_name}.py`.
+
+    Used by the Lineage Explorer's Process-node inspector so the user sees
+    what the underlying script actually does, not just its name. We `ast.parse`
+    the file rather than importing it, so reading the doc has zero side
+    effects (no DuckDB connection, no Kuzu write lock, no Bedrock call)."""
+    import ast
+
+    # Defend against path traversal: only allow alpha/digit/underscore/dash.
+    # Stage names like `_1_ingest_landing` and `01_stg_fx_normalize` qualify.
+    safe = "".join(ch for ch in stage_name if ch.isalnum() or ch in "_-")
+    if safe != stage_name:
+        raise HTTPException(400, f"invalid stage_name: {stage_name!r}")
+
+    stage_path = REPO_ROOT / "pipeline" / "stages" / f"{stage_name}.py"
+    if not stage_path.is_file():
+        raise HTTPException(404, f"no stage file at {stage_path.name}")
+
+    try:
+        tree = ast.parse(stage_path.read_text(encoding="utf-8"))
+    except SyntaxError as exc:
+        raise HTTPException(500, f"could not parse {stage_path.name}: {exc}")
+
+    docstring = ast.get_docstring(tree) or ""
+    # First line is treated as a heading; rest is body.
+    lines = docstring.splitlines()
+    headline = lines[0].strip() if lines else ""
+    body = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+
+    return {
+        "stage_name": stage_name,
+        "file": str(stage_path.relative_to(REPO_ROOT)),
+        "headline": headline,
+        "body": body,
+        "raw": docstring,
+    }
+
+
 @app.get("/")
 def index():
     return FileResponse(str(UI_ROOT / "static" / "index.html"))

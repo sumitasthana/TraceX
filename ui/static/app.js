@@ -309,6 +309,8 @@ const App = (() => {
         nodeKind: n.group,
         baseColor: n.color,
         layer: n.layer,
+        transform_type: n.transform_type,
+        duration_ms: n.duration_ms,
       })));
       const visEdges = new vis.DataSet(data.edges.map((e, i) => ({
         id: `base::${i}`,
@@ -570,9 +572,42 @@ const App = (() => {
         }
       }
 
-      function showProcess(node) {
+      async function showProcess(node) {
         titleEl.textContent = 'Process';
-        detailEl.innerHTML = `<div class="text-[12px] text-g-700"><span class="mono">${esc(node.label)}</span></div>`;
+        const stageName = node.label || '';
+        const meta = `
+          <div class="font-mono text-[12px] text-g-800">${esc(stageName)}</div>
+          <div class="flex items-center gap-1.5 mt-1">
+            ${node.transform_type ? transformBadge(node.transform_type) : ''}
+            ${node.duration_ms ? `<span class="text-[10px] text-g-400 mono">${fmtInt(node.duration_ms)}ms</span>` : ''}
+          </div>`;
+        detailEl.innerHTML = meta + `<div class="mt-3 text-[11px] text-g-400 italic" id="proc-doc-loading">Loading description…</div>`;
+
+        try {
+          const doc = await api(`/api/lineage/process_doc/${encodeURIComponent(stageName)}`);
+          const head = (doc.headline || '').trim();
+          const body = (doc.body || '').trim();
+          let bodyHtml = '';
+          if (body) {
+            try {
+              bodyHtml = window.marked && window.marked.parse
+                ? window.marked.parse(body, { gfm: true, breaks: false })
+                : '<p>' + esc(body).replace(/\n\n/g, '</p><p>') + '</p>';
+            } catch {
+              bodyHtml = '<p>' + esc(body) + '</p>';
+            }
+          }
+          detailEl.innerHTML = `
+            ${meta}
+            <div class="text-[10px] uppercase tracking-wider font-semibold text-g-400 mt-3 mb-1">What this stage does</div>
+            ${head ? `<div class="text-[12px] text-g-800 leading-snug font-medium mb-2">${esc(head)}</div>` : ''}
+            ${bodyHtml ? `<div class="disc-prose text-[11.5px]">${bodyHtml}</div>` : ''}
+            ${doc.file ? `<div class="text-[10px] text-g-400 mono mt-3">${esc(doc.file)}</div>` : ''}
+          `;
+        } catch (e) {
+          const loading = document.getElementById('proc-doc-loading');
+          if (loading) loading.textContent = `(no description available — ${e.message})`;
+        }
       }
 
       // ── Click router ──────────────────────────────────────────────────
