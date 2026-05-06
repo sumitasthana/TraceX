@@ -347,6 +347,10 @@ body { -webkit-font-smoothing: antialiased; }
   margin-top: 22px;
   margin-bottom: 12px;
 }
+.flow-layer-strip.with-ingest {
+  /* +1 leading column for INGEST processes when the new ingest stage has run */
+  grid-template-columns: 0.55fr 1fr 0.55fr 1fr 0.55fr 1fr;
+}
 .flow-layer-head {
   font-family: 'DM Mono', 'JetBrains Mono', monospace;
   font-size: 10px;
@@ -367,13 +371,16 @@ body { -webkit-font-smoothing: antialiased; }
   border: 1px dashed rgba(148,163,184,.35);
 }
 
-/* ── Board — 5 columns ──────────────────────────────────────── */
+/* ── Board — 5 columns by default, 6 when an INGEST stage is in scope ── */
 .flow-board {
   display: grid;
   grid-template-columns: 1fr 0.55fr 1fr 0.55fr 1fr;
   gap: 18px;
   position: relative;
   min-height: 380px;
+}
+.flow-board.with-ingest {
+  grid-template-columns: 0.55fr 1fr 0.55fr 1fr 0.55fr 1fr;
 }
 .flow-col {
   display: flex;

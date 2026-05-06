@@ -1110,8 +1110,10 @@ const App = (() => {
         layer_2: datasets.filter(d => d.layer === 'layer_2').sort((a,b)=>a.label.localeCompare(b.label)),
       };
 
-      // Split processes into "0→1" (produces L1) vs "1→2" (produces L2)
-      // by looking at the PRODUCES edge target's layer.
+      // Split processes by the layer they PRODUCES into. After Tier-1 the
+      // pipeline has an `_1_ingest_landing` stage that produces L0 tables —
+      // its column appears on the far left, and we only render that column
+      // when at least one such process exists.
       const procToTargetLayer = new Map();
       data.edges.forEach(e => {
         if (e.from.startsWith('proc::') && e.to.startsWith('ds::')) {
@@ -1122,8 +1124,10 @@ const App = (() => {
           }
         }
       });
-      const procs01 = procs.filter(p => procToTargetLayer.get(p.id) === 'layer_1');
-      const procs12 = procs.filter(p => procToTargetLayer.get(p.id) === 'layer_2');
+      const procsIngest = procs.filter(p => procToTargetLayer.get(p.id) === 'layer_0');
+      const procs01     = procs.filter(p => procToTargetLayer.get(p.id) === 'layer_1');
+      const procs12     = procs.filter(p => procToTargetLayer.get(p.id) === 'layer_2');
+      const showIngest = procsIngest.length > 0;
 
       // ── Render shell ────────────────────────────────────────────────
       const totalCols = datasets.reduce((acc, d) => {
@@ -1167,7 +1171,8 @@ const App = (() => {
             <div class="flow-stat"><span class="num">${fmtInt(data.edges.length)}</span><span class="label">Edges</span></div>
           </div>
 
-          <div class="flow-layer-strip">
+          <div class="flow-layer-strip ${showIngest ? 'with-ingest' : ''}">
+            ${showIngest ? '<div class="flow-layer-head proc">Ingest</div>' : ''}
             <div class="flow-layer-head l0">L0 · Raw sources</div>
             <div class="flow-layer-head proc">0 → 1 transforms</div>
             <div class="flow-layer-head l1">L1 · Staging</div>
@@ -1175,9 +1180,13 @@ const App = (() => {
             <div class="flow-layer-head l2">L2 · Facts</div>
           </div>
 
-          <div id="flow-board" class="flow-board">
+          <div id="flow-board" class="flow-board ${showIngest ? 'with-ingest' : ''}">
             <svg class="flow-svg" id="flow-svg" preserveAspectRatio="none"></svg>
 
+            ${showIngest ? `
+              <div class="flow-col" id="col-ingest">
+                ${procsIngest.map(procCard).join('')}
+              </div>` : ''}
             <div class="flow-col" id="col-l0">
               ${dsByLayer.layer_0.map(dsCard).join('')}
             </div>
